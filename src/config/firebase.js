@@ -1,16 +1,23 @@
 const admin = require("firebase-admin");
+const path  = require("path");
 
-// Load service account from the JSON file you downloaded from Firebase Console
-const serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH
-  ? require("path").resolve(process.env.FIREBASE_SERVICE_ACCOUNT_PATH)
-  : "../../serviceAccountKey.json"
-);
+const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+  ? path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT_PATH)
+  : path.resolve(__dirname, "../../serviceAccountKey.json");
+
+const serviceAccount = require(serviceAccountPath);
 
 if (!admin.apps.length) {
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+    credential:    admin.credential.cert(serviceAccount),
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
   });
   console.log("✅ Firebase Admin initialized");
+  console.log(`📦 Storage bucket: ${admin.storage().bucket().name}`);
 }
 
-module.exports = admin;
+// Export both admin AND bucket
+// evidenceController needs: const { bucket } = require("../config/firebase")
+const bucket = admin.storage().bucket();
+
+module.exports = { admin, bucket };
