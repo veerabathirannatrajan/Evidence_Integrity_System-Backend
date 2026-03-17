@@ -1,10 +1,12 @@
-const express           = require("express");
-const router            = express.Router();
-const custodyController = require("../controllers/custodyController");
-const auth              = require("../middleware/authMiddleware");
+// src/routes/custodyRoutes.js
+const express = require("express");
+const router  = express.Router();
+const auth    = require("../middleware/authMiddleware");
+const ctrl    = require("../controllers/custodyController");
 
-// All custody routes are protected
-router.post("/transfer",          auth, custodyController.transferEvidence);
-router.get("/history/:evidenceId", auth, custodyController.getCustodyHistory);
+router.post("/transfer",           auth, ctrl.transferCustody);
+router.get("/history/:evidenceId", auth, ctrl.getCustodyHistory);
+router.get("/case/:caseId",        auth, ctrl.getCustodyByCase);
+router.get("/allowed-roles",       auth, ctrl.getAllowedRoles);
 
 module.exports = router;
