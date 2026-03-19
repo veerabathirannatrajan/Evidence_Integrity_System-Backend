@@ -1,0 +1,2285 @@
+Here is the complete content of all files in the evidence-backend project, organized by file path:
+
+---
+
+=== vercel.json ===
+```json
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "src/server.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "src/server.js"
+    }
+  ]
+}
+```
+
+---
+
+=== scripts/deploy.js ===
+```javascript```javascript
+const hre = require("hardhat");
+
+async function main() {
+  console.log("Deploying EvidenceRegistry to Polygon Mumbai...");
+
+  const EvidenceRegistry = await hre.ethers.getContractFactory("EvidenceRegistry");
+  const contract = await EvidenceRegistry.deploy();
+
+  await contract.waitForDeployment();
+
+  const address = await contract.getAddress();
+  console.log("✅ EvidenceRegistry deployed to:", address);
+  console.log("Copy this address into your .env as CONTRACT_ADDRESS=", address);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+---
+
+=== src/services/tamperMonitor.js ===
+```javascript
+const Evidence       = require("../models/Evidence");
+const { verifyOnChain } = require("./blockchainService");
+const { sendTamperAlert } = require("./alertService");
+
+let _isRunning = false;
+
+/**
+ * Runs every 5 minutes.
+ * For every anchored evidence, re-verifies its hash on-chain.
+ * If mismatch found → marks as tampered + sends n8n alert.
+ */
+async function runTamperCheck() {
+  if (_isRunning) return;
+  _isRunning = true;
+
+  console.log(`🔍 [${new Date().toISOString()}] Running tamper check...`);
+
+  try {
+    const anchored = await Evidence.find({
+      blockchainStatus: "anchored",
+      isTampered: { $ne: true },        // skip already flagged
+    }).select("_id fileHash blockchainTxHash fileName caseId uploadedBy");
+
+    let checked = 0, flagged = 0;
+
+    for (const ev of anchored) {
+      try {
+        const result = await verifyOnChain(
+          ev._id.toString(), ev.fileHash
+        );
+
+        if (!result.valid) {
+          // Flag as tampered
+          await Evidence.findByIdAndUpdate(ev._id, {
+            isTampered:      true,
+            tamperedAt:      new Date(),
+            tamperSource:    "auto_monitor",
+          });
+
+          // Send alert
+          await sendTamperAlert({
+            evidenceId:   ev._id.toString(),
+            fileName:     ev.fileName,
+            originalHash: ev.fileHash,
+            newHash:      "blockchain_mismatch",
+            detectedBy:   "system_monitor",
+          });
+
+          flagged++;
+          console.warn(`🚨 Tamper detected (auto): ${ev._id} — ${ev.fileName}`);
+        }
+
+        checked++;
+      } catch (err) {
+        console.error(`Monitor check error for ${ev._id}:`, err.message);
+      }
+    }
+
+    console.log(
+      `✅ Tamper check done. Checked: ${checked}, Flagged: ${flagged}`
+    );
+  } catch (err) {
+    console.error("Tamper monitor error:", err);
+  } finally {
+    _isRunning = false;
+  }
+}
+
+/**
+ * Start the monitor — call once from server.js
+ */
+function startTamperMonitor() {
+  const INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+  console.log("🛡️  Tamper monitor started (every 5 minutes)");
+
+  // Run immediately on startup
+  runTamperCheck();
+
+  // Then every 5 minutes
+  setInterval(runTamperCheck, INTERVAL_MS);
+}
+
+module.exports = { startTamperMonitor, runTamperCheck };
+```
+
+---
+
+=== src/services/hashService.js ===
+```javascript
+const crypto = require("crypto");
+
+/**
+ * Generate SHA-256 hash from a file buffer.
+ * @param {Buffer} buffer - file buffer from multer memoryStorage
+ * @returns {string} hex string hash
+ */
+function generateHash(buffer) {
+  return crypto
+    .createHash("sha256")
+    .update(buffer)
+    .digest("hex");
+}
+
+module.exports = generateHash;
+```
+
+---
+
+=== src/services/blockchainService.js ===
+```javascript
+const { ethers } = require("ethers");
+const path = require("path");
+const fs = require("fs");
+
+// ─── Load ABI from compiled artifact ────────────────────────────────────────
+// This file is generated when you run: npx hardhat compile
+const artifactPath = path.join(
+  __dirname,
+  "../../artifacts/contracts/EvidenceRegistry.sol/EvidenceRegistry.json"
+);
+
+let contract = null;
+
+function getContract() {
+  if (contract) return contract;
+
+  if (!fs.existsSync(artifactPath)) {
+    throw new Error(
+      "Contract artifact not found. Run: npx hardhat compile"
+    );
+  }
+
+  const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
+
+  const provider = new ethers.JsonRpcProvider(process.env.POLYGON_RPC_URL);
+  const wallet   = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+
+  contract = new ethers.Contract(
+    process.env.CONTRACT_ADDRESS,
+    artifact.abi,
+    wallet
+  );
+
+  return contract;
+}
+
+/**
+ * Anchor an evidence hash on the Polygon blockchain.
+ * @param {string} evidenceId  - MongoDB _id of the evidence document
+ * @param {string} hash        - SHA-256 hex string
+ * @returns {string} transaction hash
+ */
+async function anchorHash(evidenceId, hash) {
+  const c = getContract();
+  const tx = await c.registerEvidence(evidenceId, hash);
+  await tx.wait();           // wait for 1 confirmation
+  return tx.hash;
+}
+
+/**
+ * Verify an evidence hash on-chain.
+ * @param {string} evidenceId
+ * @param {string} hash
+ * @returns {{ valid: boolean, timestamp: string }}
+ */
+async function verifyOnChain(evidenceId, hash) {
+  const c = getContract();
+  const [valid, timestamp] = await c.verifyEvidence(evidenceId, hash);
+  return {
+    valid,
+    timestamp: timestamp.toString()   // BigInt → string
+  };
+}
+
+/**
+ * Get the full on-chain record for an evidence ID.
+ * @param {string} evidenceId
+ * @returns {{ hash, registeredBy, timestamp, exists }}
+ */
+async function getOnChainRecord(evidenceId) {
+  const c = getContract();
+  const [hash, registeredBy, timestamp, exists] = await c.getRecord(evidenceId);
+  return {
+    hash,
+    registeredBy,
+    timestamp: timestamp.toString(),
+    exists
+  };
+}
+
+module.exports = { anchorHash, verifyOnChain, getOnChainRecord };
+```
+
+---
+
+=== src/services/alertService.js ===
+```javascript
+const fetch = require("node-fetch");
+
+/**
+ * Send a tamper alert to n8n webhook.
+ * n8n will forward it as WhatsApp + Email notification.
+ *
+ * @param {object} data
+ * @param {string} data.evidenceId
+ * @param {string} data.fileName
+ * @param {string} data.originalHash
+ * @param {string} data.newHash
+ * @param {string} data.detectedBy  - Firebase UID of the user who verified
+ */
+async function sendTamperAlert(data) {
+  if (!process.env.N8N_WEBHOOK_URL) {
+    console.warn("N8N_WEBHOOK_URL not set — skipping alert");
+    return;
+  }
+
+  try {
+    await fetch(process.env.N8N_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        evidenceId:   data.evidenceId,
+        fileName:     data.fileName,
+        originalHash: data.originalHash,
+        newHash:      data.newHash,
+        detectedBy:   data.detectedBy,
+        detectedAt:   new Date().toISOString(),
+        status:       "TAMPERED"
+      })
+    });
+    console.log("🚨 Tamper alert sent to n8n for evidence:", data.evidenceId);
+  } catch (err) {
+    console.error("Failed to send tamper alert:", err.message);
+  }
+}
+
+module.exports = { sendTamperAlert };
+```
+
+---
+
+=== README.md ===
+```markdown
+# Blockchain Evidence Integrity — Backend
+
+Complete setup guide from zero to running.
+
+---
+
+## Project Structure
+
+```
+evidence-backend/
+├── contracts/
+│    └── EvidenceRegistry.sol       ← Solidity smart contract
+├── scripts/
+│    └── deploy.js                  ← Hardhat deploy script
+├── src/
+│   ├── config/
+│   │    ├── db.js                  ← MongoDB connection
+│   │    └── firebase.js            ← Firebase Admin init
+│   ├── models/
+│   │    ├── User.js
+│   │    ├── Case.js
+│   │    ├── Evidence.js
+│   │    └── Custody.js
+│   ├── controllers/
+│   │    ├── userController.js
+│   │    ├── caseController.js
+│   │    ├── evidenceController.js
+│   │    └── custodyController.js
+│   ├── services/
+│   │    ├── hashService.js         ← SHA-256 hashing
+│   │    ├── blockchainService.js   ← Polygon anchoring
+│   │    └── alertService.js        ← n8n tamper alerts
+│   ├── routes/
+│   │    ├── userRoutes.js
+│   │    ├── caseRoutes.js
+│   │    ├── evidenceRoutes.js
+│   │    └── custodyRoutes.js
+│   ├── middleware/
+│   │    └── authMiddleware.js      ← Firebase token verification
+│   ├── app.js
+│   └── server.js
+├── .env.example
+├── .gitignore
+├── hardhat.config.js
+└── package.json
+```
+
+---
+
+## STEP 1 — Install dependencies
+
+```bash
+npm install
+```
+
+---
+
+## STEP 2 — Firebase setup
+
+### 2a. Create Firebase project
+1. Go to https://console.firebase.google.com
+2. Click "Add project" → give it a name → Create
+3. Go to **Authentication** → Get Started → enable **Email/Password**
+
+### 2b. Download service account key
+1. In Firebase Console → click the ⚙️ gear → **Project Settings**
+2. Go to **Service Accounts** tab
+3. Click **Generate new private key** → Download JSON
+4. Rename it to `serviceAccountKey.json`
+5. Place it in the **root** of your project (same level as package.json)
+6. Make sure `.gitignore` has `serviceAccountKey.json` ← never commit this
+
+---
+
+## STEP 3 — MongoDB Atlas setup
+
+1. Go to https://cloud.mongodb.com → create a free cluster
+2. Click **Connect** → **Connect your application**
+3. Copy the connection string — looks like:
+   `mongodb+srv://username:password@cluster.mongodb.net/evidenceDB`
+4. Save it for your `.env`
+
+---
+
+## STEP 4 — Create your .env file
+
+Copy `.env.example` to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+```env
+PORT=5000
+MONGO_URI=mongodb+srv://youruser:yourpassword@cluster.mongodb.net/evidenceDB
+FIREBASE_SERVICE_ACCOUNT_PATH=./serviceAccountKey.json
+POLYGON_RPC_URL=https://rpc-mumbai.maticvigil.com
+PRIVATE_KEY=your_metamask_private_key
+CONTRACT_ADDRESS=                          ← fill this after Step 6
+N8N_WEBHOOK_URL=https://your-n8n.com/webhook/tamper-alert
+```
+
+> ⚠️ PRIVATE_KEY is your MetaMask wallet private key.
+> Export it from MetaMask → Account Details → Export Private Key.
+> Never share this or commit it to GitHub.
+
+---
+
+## STEP 5 — Get test MATIC for Mumbai testnet
+
+You need free test MATIC to pay for deploying the contract.
+
+1. Open MetaMask → switch network to **Polygon Mumbai Testnet**
+   (if not listed, add it: https://chainlist.org → search Mumbai)
+2. Go to https://faucet.polygon.technology
+3. Paste your wallet address → Request 0.5 MATIC
+4. Wait ~30 seconds for it to arrive in your MetaMask
+
+---
+
+## STEP 6 — Compile and deploy the smart contract
+
+### 6a. Compile
+```bash
+npx hardhat compile
+```
+
+You should see:
+```
+Compiled 1 Solidity file successfully
+```
+
+This creates `artifacts/contracts/EvidenceRegistry.sol/EvidenceRegistry.json`
+The backend reads the ABI from this file automatically — don't delete it.
+
+### 6b. Deploy to Mumbai testnet
+```bash
+npx hardhat run scripts/deploy.js --network mumbai
+```
+
+You should see:
+```
+Deploying EvidenceRegistry to Polygon Mumbai...
+✅ EvidenceRegistry deployed to: 0xABC123...
+```
+
+### 6c. Save the contract address
+Copy the deployed address and paste it into your `.env`:
+```env
+CONTRACT_ADDRESS=0xABC123...
+```
+
+### 6d. Verify on explorer (optional but recommended)
+Go to https://mumbai.polygonscan.com and search your contract address.
+You should see your deployment transaction.
+
+---
+
+## STEP 7 — n8n setup (tamper alerts)
+
+### 7a. Install n8n (local)
+```bash
+npx n8n
+```
+Or use n8n cloud: https://app.n8n.io
+
+### 7b. Create the workflow
+1. Open n8n → **New Workflow**
+2. Add node: **Webhook**
+   - Method: POST
+   - Path: `tamper-alert`
+   - Copy the webhook URL → paste into `.env` as N8N_WEBHOOK_URL
+3. Add node: **Send Email (SMTP)**
+   - Connect your Gmail/SMTP credentials
+   - Subject: `⚠️ Evidence Tampered — {{$json.evidenceId}}`
+   - Body: `File: {{$json.fileName}} detected as tampered at {{$json.detectedAt}}`
+4. (Optional) Add node: **Twilio** for WhatsApp alert
+   - Message: `ALERT: Evidence {{$json.evidenceId}} has been tampered!`
+5. **Activate** the workflow
+
+---
+
+## STEP 8 — Run the backend
+
+```bash
+npm run dev
+```
+
+You should see:
+```
+🚀 Server running on port 5000
+✅ MongoDB Connected
+✅ Firebase Admin initialized
+```
+
+---
+
+## API Reference
+
+### User
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | /api/user/create | ✅ | Save user + set Firebase role claim |
+| GET | /api/user/me | ✅ | Get current user profile |
+
+**POST /api/user/create body:**
+```json
+{
+  "uid": "firebase_uid_here",
+  "name": "Officer Ravi",
+  "email": "ravi@police.gov",
+  "role": "police"
+}
+```
+
+---
+
+### Cases
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | /api/cases | ✅ | Create a new case |
+| GET | /api/cases | ✅ | Get all cases |
+| GET | /api/cases/:id | ✅ | Get single case |
+
+**POST /api/cases body:**
+```json
+{
+  "title": "Case #2024-001",
+  "description": "Armed robbery investigation"
+}
+```
+
+---
+
+### Evidence
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | /api/evidence/upload | ✅ | Upload evidence file |
+| POST | /api/evidence/verify | ✅ | Verify evidence integrity |
+| GET | /api/evidence/case/:caseId | ✅ | All evidence for a case |
+| GET | /api/evidence/:id | ✅ | Single evidence record |
+
+**POST /api/evidence/upload** — form-data:
+```
+file     = <file>
+caseId   = 65f1a2b3c4d5e6f7a8b9c0d1
+```
+
+**POST /api/evidence/verify** — form-data:
+```
+file        = <file>
+evidenceId  = 65f1a2b3c4d5e6f7a8b9c0d2
+```
+
+**Verify response — clean:**
+```json
+{
+  "status": "VERIFIED",
+  "message": "✅ Evidence integrity verified",
+  "hash": "cf4bc1fb...",
+  "anchoredAt": "2024-03-01T10:30:00Z",
+  "blockchain": { "valid": true, "timestamp": "1709288400" }
+}
+```
+
+**Verify response — tampered:**
+```json
+{
+  "status": "TAMPERED",
+  "message": "⚠️ Evidence has been tampered!",
+  "originalHash": "cf4bc1fb...",
+  "newHash": "9a2f44cc...",
+  "blockchain": { "valid": false, "timestamp": "1709288400" }
+}
+```
+
+---
+
+### Chain of Custody
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | /api/custody/transfer | ✅ | Transfer evidence to another user |
+| GET | /api/custody/history/:evidenceId | ✅ | Full custody timeline |
+
+**POST /api/custody/transfer body:**
+```json
+{
+  "evidenceId": "65f1a2b3c4d5e6f7a8b9c0d2",
+  "toUser": "firebase_uid_of_receiver",
+  "reason": "Sending to forensic lab for analysis"
+}
+```
+
+---
+
+### How to send requests from Flutter
+
+Every request needs the Firebase ID token in the header:
+
+```dart
+final token = await FirebaseAuth.instance.currentUser!.getIdToken();
+
+final response = await http.post(
+  Uri.parse('http://your-server:5000/api/evidence/upload'),
+  headers: {
+    'Authorization': 'Bearer $token',
+  },
+  // body...
+);
+```
+
+---
+
+## How the full flow works
+
+```
+1. Flutter: user registers with Firebase Auth
+        ↓
+2. Flutter: calls POST /api/user/create  (sends uid + role)
+        ↓
+3. Backend: saves user to MongoDB + sets Firebase custom claim (role)
+        ↓
+4. Flutter: user logs in → Firebase returns ID token
+        ↓
+5. Flutter: uploads evidence file to POST /api/evidence/upload
+        ↓
+6. Backend: generates SHA-256 hash → saves to MongoDB (status: pending)
+        ↓
+7. Backend: anchors hash on Polygon → updates MongoDB (status: anchored, txHash)
+        ↓
+8. Flutter: calls POST /api/evidence/verify with same file later
+        ↓
+9. Backend: hashes file → compares with stored hash → checks blockchain
+        ↓
+10a. Match    → returns VERIFIED ✅
+10b. Mismatch → returns TAMPERED ⚠️ + triggers n8n → WhatsApp + Email alert
+```
+```
+
+---
+
+=== package.json ===
+```json
+{
+  "name": "evidence-backend",
+  "version": "1.0.0",
+  "description": "Blockchain Evidence Integrity Backend",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js",
+    "compile": "npx hardhat compile",
+    "deploy": "npx hardhat run scripts/deploy.js --network mumbai"
+  },
+  "keywords": [],
+  "author": "Veera",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google-cloud/storage": "^7.19.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "ethers": "^6.7.0",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.7.0",
+    "mongoose": "^9.2.4",
+    "multer": "^2.1.1",
+    "node-fetch": "^2.7.0",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.19.0",
+    "nodemon": "^3.1.14"
+  }
+}
+```
+
+---
+
+=== hardhat.config.js ===
+```javascript
+require("@nomicfoundation/hardhat-toolbox");
+require("dotenv").config();
+
+/** @type import('hardhat/config').HardhatUserConfig */
+module.exports = {
+  solidity: "0.8.20",
+  networks: {
+    amoy: {
+      url: process.env.POLYGON_RPC_URL,
+      accounts: [process.env.PRIVATE_KEY],
+      chainId: 80002
+    }
+  }
+};
+```
+
+---
+
+=== fix_download_urls.js ===
+(The file `fix_download_urls.js` exists, but is empty)
+
+---
+
+=== src/server.js ===
+```javascript
+require("dotenv").config();
+
+const app       = require("./app");
+const connectDB = require("./config/db");
+const { startTamperMonitor } = require("./services/tamperMonitor");
+
+// Init Firebase Admin
+require("./config/firebase");
+
+connectDB().then(() => {
+  // Start auto tamper monitor after DB is ready
+  startTamperMonitor();
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
+```
+
+---
+
+=== contracts/EvidenceRegistry.sol ===
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * EvidenceRegistry
+ * Stores SHA-256 hashes of digital evidence on the Polygon blockchain.
+ * Once a hash is registered it cannot be changed — providing immutable proof
+ * of the file's state at upload time.
+ */
+contract EvidenceRegistry {
+
+    // ─── Data ──────────────────────────────────────────────────────────────
+
+    struct EvidenceRecord {
+        string  hash;
+        address registeredBy;
+        uint256 timestamp;
+        bool    exists;
+    }
+
+    // evidenceId (MongoDB ObjectId string) → record
+    mapping(string => EvidenceRecord) private records;
+
+    // ─── Events ────────────────────────────────────────────────────────────
+
+    event EvidenceRegistered(
+        string indexed evidenceId,
+        string hash,
+        address registeredBy,
+        uint256 timestamp
+    );
+
+    // ─── Functions ─────────────────────────────────────────────────────────
+
+    /**
+     * Register a new evidence hash.
+     * @param evidenceId  MongoDB _id of the evidence document
+     * @param hash        SHA-256 hash of the file
+     */
+    function registerEvidence(
+        string memory evidenceId,
+        string memory hash
+    ) public {
+        require(!records[evidenceId].exists, "Evidence already registered");
+
+        records[evidenceId] = EvidenceRecord({
+            hash:         hash,
+            registeredBy: msg.sender,
+            timestamp:    block.timestamp,
+            exists:       true
+        });
+
+        emit EvidenceRegistered(evidenceId, hash, msg.sender, block.timestamp);
+    }
+
+    /**
+     * Verify an evidence hash against what was registered.
+     * @param evidenceId  MongoDB _id of the evidence document
+     * @param hash        SHA-256 hash to check
+     * @return valid      true if hash matches the registered value
+     * @return timestamp  Unix timestamp of registration (0 if not found)
+     */
+    function verifyEvidence(
+        string memory evidenceId,
+        string memory hash
+    ) public view returns (bool valid, uint256 timestamp) {
+        EvidenceRecord memory rec = records[evidenceId];
+        if (!rec.exists) return (false, 0);
+
+        bool match_ = keccak256(bytes(rec.hash)) == keccak256(bytes(hash));
+        return (match_, rec.timestamp);
+    }
+
+    /**
+     * Fetch the stored record for an evidence ID.
+     */
+    function getRecord(string memory evidenceId)
+        public view
+        returns (string memory hash, address registeredBy, uint256 timestamp, bool exists)
+    {
+        EvidenceRecord memory rec = records[evidenceId];
+        return (rec.hash, rec.registerBy, rec.timestamp, rec.exists);
+    }
+}
+```
+
+---
+
+=== .gitignore ===
+```
+node_modules/
+.env
+serviceAccountKey.json
+artifacts/
+cache/
+```
+
+---
+
+=== .env===
+```env
+# ─── Server ─────────────────────────
+PORT=5000
+
+# ─── MongoDB ────────────────────────
+MONGO_URI=mongodb+srv://evidence_db_user:Veera%402007@evidencecluster.6gzdcxb.mongodb.net/evidence_system
+
+# ─── Firebase ───────────────────────
+FIREBASE_SERVICE_ACCOUNT_PATH=./serviceAccountKey.json
+
+# ─── Blockchain (Polygon Amoy Testnet) ───
+POLYGON_RPC_URL=https://rpc-amoy.polygon.technology
+PRIVATE_KEY=f55c4b6deaa051286eb3f7c8264d5437eccb476750c555bf05bb2e3c7c4c01b7
+CONTRACT_ADDRESS=0xac93065946CeADe04BD0233552177e33ea1dd651
+
+# ─── n8n Automation ─────────────────
+N8N_WEBHOOK_URL=https://thirzzz.app.n8n.cloud/webhook/tamper-alert
+
+FIREBASE_STORAGE_BUCKET=evidence-system-6f225.firebasestorage.app
+
+---
+
+=== src/app.js ===
+```javascript
+const express       = require("express");
+const cors          = require("cors");
+
+const userRoutes     = require("./routes/userRoutes");
+const caseRoutes     = require("./routes/caseRoutes");
+const evidenceRoutes = require("./routes/evidenceRoutes");
+const custodyRoutes  = require("./routes/custodyRoutes");
+
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+// ─── Health check ──────────────────────────────────────────────────────────
+app.get("/", (req, res) => {
+  res.json({ message: "Evidence Backend Running ✅", version: "1.0.0" });
+});
+
+// ─── Routes ────────────────────────────────────────────────────────────────
+app.use("/api/user",     userRoutes);
+app.use("/api/cases",    caseRoutes);
+app.use("/api/evidence", evidenceRoutes);
+app.use("/api/custody",  custodyRoutes);
+
+// ─── Global error handler ──────────────────────────────────────────────────
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ message: "Internal server error" });
+});
+
+module.exports = app;
+```
+
+---
+
+=== src/routes/userRoutes.js ===
+```javascript
+const express        = require("express");
+const router         = express.Router();
+const userController = require("../controllers/userController");
+const auth           = require("../middleware/authMiddleware");
+
+// POST /api/user/create  — called once after Flutter Firebase registration
+router.post("/create", auth, userController.createUser);
+
+// GET  /api/user/me      — get logged-in user's profile
+router.get("/me", auth, userController.getMe);
+
+module.exports = router;
+```
+
+---
+
+=== src/routes/evidenceRoutes.js ===
+```javascript
+// src/routes/evidenceRoutes.js
+const express  = require("express");
+const multer   = require("multer");
+const router   = express.Router();
+const auth     = require("../middleware/authMiddleware");
+const ctrl     = require("../controllers/evidenceController");
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB
+});
+
+// ── Fixed routes MUST come before /:id ──────────────────────
+router.get("/stats",                auth, ctrl.getStats);
+router.get("/summary",              auth, ctrl.getSummary);
+router.get("/recent-activity",      auth, ctrl.getRecentActivity);
+router.get("/recent/:limit",        auth, ctrl.getRecentEvidence);
+router.get("/cases-with-evidence",  auth, ctrl.getCasesWithEvidence);
+
+// Public QR
+router.get("/public/:id", ctrl.getEvidenceById);
+
+// Upload + Verify (multer required)
+router.post("/upload", auth, upload.single("file"), ctrl.uploadEvidence);
+router.post("/verify", auth, upload.single("file"), ctrl.verifyEvidence);
+
+// By case
+router.get("/case/:caseId", auth, ctrl.getEvidenceByCase);
+
+// Single — ALWAYS last
+router.get("/:id", auth, ctrl.getEvidenceById);
+
+// ── File proxy — streams Firebase Storage files through backend ────
+// Bypasses CORS since browser requests same-origin backend URL
+// GET /api/evidence/image-proxy?path=evidence/caseId/filename
+// No auth needed — files are public (Storage rules: allow read: if true)
+router.get("/image-proxy", async (req, res) => {
+  try {
+    const { bucket } = require("../config/firebase");
+    const filePath = decodeURIComponent(req.query.path || "");
+    if (!filePath) return res.status(400).json({ message: "path required" });
+
+    const file = bucket.file(filePath);
+    const [exists] = await file.exists();
+    if (!exists) return res.status(404).json({ message: "File not found" });
+
+    const [meta] = await file.getMetadata();
+    const contentType = meta.contentType || "application/octet-stream";
+    const fileName = (meta.metadata && meta.metadata.originalFileName)
+        || filePath.split("/").pop() || "file";
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.setHeader("Content-Disposition",
+        `inline; filename="${encodeURIComponent(fileName)}"`);
+    // CORS headers for browser
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    file.createReadStream()
+      .on("error", (err) => {
+        if (!res.headersSent) res.status(500).end();
+      })
+      .pipe(res);
+  } catch (err) {
+    console.error("image-proxy error:", err);
+    if (!res.headersSent) res.status(500).json({ message: err.message });
+  }
+});
+
+module.exports = router;
+```
+
+---
+
+=== src/routes/custodyRoutes.js ===
+```javascript
+// src/routes/custodyRoutes.js
+const express = require("express");
+const router  = express.Router();
+const auth    = require("../middleware/authMiddleware");
+const ctrl    = require("../controllers/custodyController");
+
+router.post("/transfer",           auth, ctrl.transferCustody);
+router.get("/history/:evidenceId", auth, ctrl.getCustodyHistory);
+router.get("/case/:caseId",        auth, ctrl.getCustodyByCase);
+router.get("/allowed-roles",       auth, ctrl.getAllowedRoles);
+
+module.exports = router;
+```
+
+---
+
+=== src/routes/caseRoutes.js ===
+```javascript
+const express        = require("express");
+const router         = express.Router();
+const caseController = require("../controllers/caseController");
+const auth           = require("../middleware/authMiddleware");
+
+// All case routes are protected
+router.post("/",           auth, caseController.createCase);
+router.get("/",            auth, caseController.getAllCases);
+router.get("/stats",       auth, caseController.getCaseStats);    // 👈 NEW
+router.get("/:id",         auth, caseController.getCaseById);
+router.patch("/:id",       auth, caseController.updateCase);      // 👈 NEW
+router.patch("/:id/status", auth, caseController.updateCaseStatus);
+router.delete("/:id",      auth, caseController.deleteCase);      // 👈 NEW
+
+module.exports = router;
+```
+
+---
+
+=== src/models/User.js ===
+```javascript
+const mongoose = require("mongoose");
+
+const userSchema = new mongoose.Schema({
+  uid: {
+    type: String,
+    unique: true,
+    required: true
+  },
+  name: {
+    type: String,
+    required: true
+  },
+  email: {
+    type: String,
+    unique: true,
+    required: true
+  },
+  role: {
+    type: String,
+    enum: ["police", "forensic", "prosecutor", "defense", "court"],
+    required: true
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+module.exports = mongoose.model("User", userSchema);
+```
+
+---
+
+=== src/models/Case.js ===
+```javascript
+const mongoose = require("mongoose");
+
+const caseSchema = new mongoose.Schema({
+  // ── New fields ─────────────────────────────────────────────
+  priority: {
+    type: String,
+    enum: ["low", "medium", "high", "critical"],
+    default: "medium",
+  },
+
+  caseType: {
+    type: String,
+    enum: ["criminal", "civil", "cyber", "fraud", "narcotics", "other"],
+    default: "criminal",
+  },
+
+  location: {
+    type: String,
+    default: "",
+    trim: true,
+  },
+
+  caseRef: {
+    type: String,
+    default: "",
+    trim: true,
+  },
+
+  incidentDate: {
+    type: Date,
+    default: Date.now,
+  },
+
+  // ── Existing fields (enhanced) ─────────────────────────────
+  title: {
+    type: String,
+    required: true,
+    trim: true,  // Added trim
+  },
+
+  description: {
+    type: String,
+    default: "",
+    trim: true,  // Added trim
+  },
+
+  createdBy: {
+    type: String,   // Firebase UID
+    required: true,
+  },
+
+  status: {
+    type: String,
+    enum: ["open", "closed", "under_review"],
+    default: "open",
+  },
+
+  createdAt: {
+    type: Date,
+    default: Date.now,
+  },
+});
+
+module.exports = mongoose.model("Case", caseSchema);
+```
+
+---
+
+=== src/models/Evidence.js ===
+```javascript
+// src/models/Evidence.js
+const mongoose = require("mongoose");
+
+const evidenceSchema = new mongoose.Schema({
+  caseId:       { type: String, required: true },
+  fileName:     { type: String, required: true },
+  fileType:     { type: String, default: "" },
+  fileSize:     { type: Number, default: 0 },
+  fileHash:     { type: String, required: true },   // original SHA-256
+  storagePath:  { type: String, required: true },
+  downloadURL:  { type: String, default: "" },
+  uploadedBy:   { type: String, required: true },
+  description:  { type: String, default: "" },
+  evidenceType: {
+    type: String,
+    enum: ["image", "video", "audio", "document", "other"],
+    default: "document",
+  },
+
+  // ── Blockchain ───────────────────────────────────────────
+  blockchainTxHash: { type: String, default: null },
+  blockchainStatus: {
+    type: String,
+    enum: ["pending", "anchored", "failed"],
+    default: "pending",
+  },
+  anchoredAt: { type: Date, default: null },
+
+  // ── Tamper tracking ──────────────────────────────────────
+  isTampered:   { type: Boolean, default: false },
+  tamperedAt:   { type: Date,    default: null },
+  tamperSource: { type: String,  default: null },   // "manual_verify" | "auto_monitor"
+  tamperedHash: { type: String,  default: null },   // hash of the modified file
+
+  createdAt: { type: Date, default: Date.now },
+});
+
+module.exports = mongoose.model("Evidence", evidenceSchema);
+```
+
+---
+
+=== src/models/Custody.js ===
+```javascript
+// src/models/Custody.js
+const mongoose = require("mongoose");
+
+const custodySchema = new mongoose.Schema({
+  evidenceId:   { type: String, required: true },
+  caseId:       { type: String, required: true },
+  evidenceName: { type: String, default: "" },
+
+  // Who sent and who received
+  fromUser:     { type: String, required: true }, // Firebase UID
+  fromRole:     { type: String, required: true }, // police/forensic/prosecutor/defense/court
+  fromName:     { type: String, default: "" },    // display name/email
+
+  toUser:       { type: String, required: true }, // Firebase UID or email
+  toRole:       { type: String, required: true }, // target role
+  toName:       { type: String, default: "" },    // display name/email
+
+  reason:       { type: String, required: true },
+  notes:        { type: String, default: "" },
+
+  // Chain position (1 = first transfer, 2 = second, etc.)
+  chainPosition: { type: Number, default: 1 },
+
+  // Verification hash at time of transfer (confirms no tampering before handoff)
+  hashAtTransfer: { type: String, default: "" },
+
+  timestamp: { type: Date, default: Date.now },
+});
+
+// Index for fast lookup
+custodySchema.index({ evidenceId: 1, timestamp: 1 });
+custodySchema.index({ caseId: 1, timestamp: -1 });
+
+module.exports = mongoose.model("Custody", custodySchema);
+```
+
+---
+
+=== src/config/db.js ===
+```javascript
+const mongoose = require("mongoose");
+
+const connectDB = async () => {
+  try {
+    await mongoose.connect(process.env.MONGO_URI);
+    console.log("✅ MongoDB Connected");
+  } catch (error) {
+    console.error("❌ MongoDB connection error:", error.message);
+    process.exit(1);
+  }
+};
+
+module.exports = connectDB;
+```
+
+---
+
+=== src/config/firebase.js ===
+```javascript
+const admin = require("firebase-admin");
+const path  = require("path");
+
+const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+  ? path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT_PATH)
+  : path.resolve(__dirname, "../../serviceAccountKey.json");
+
+const serviceAccount = require(serviceAccountPath);
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential:    admin.credential.cert(serviceAccount),
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+  });
+  console.log("✅ Firebase Admin initialized");
+  console.log(`📦 Storage bucket: ${admin.storage().bucket().name}`);
+}
+
+// Export both admin AND bucket
+// evidenceController needs: const { bucket } = require("../config/firebase")
+const bucket = admin.storage().bucket();
+
+module.exports = { admin, bucket };
+```
+
+---
+
+=== src/middleware/authMiddleware.js ===
+```javascript
+// src/middleware/authMiddleware.js
+const { admin } = require("../config/firebase");
+
+module.exports = async function (req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Unauthorized: No token" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    // checkRevoked: true — ensures revoked tokens after role update are rejected
+    const decoded = await admin.auth().verifyIdToken(token, true);
+
+    req.user = {
+      uid:   decoded.uid,
+      email: decoded.email || "",
+      role:  decoded.role  || "police", // role from custom claims
+      name:  decoded.name  || "",
+    };
+
+    next();
+  } catch (err) {
+    console.error("Auth error:", err.message);
+    if (err.code === "auth/id-token-revoked") {
+      return res.status(401).json({
+        message: "Token revoked. Please log in again.",
+        code: "TOKEN_REVOKED",
+      });
+    }
+    return res.status(401).json({ message: "Unauthorized: Invalid token" });
+  }
+};
+```
+
+---
+
+=== src/controllers/userController.js ===
+```javascript
+// src/controllers/userController.js
+const { admin }     = require("../config/firebase");
+const User          = require("../models/User");
+
+/**
+ * POST /api/user/create
+ * Called after Firebase signup.
+ * Saves user to MongoDB AND sets custom claim role in Firebase.
+ */
+exports.createUser = async (req, res) => {
+  try {
+    const { uid, name, email, role } = req.body;
+
+    if (!uid || !email || !role) {
+      return res.status(400).json({
+        message: "uid, email and role are required",
+      });
+    }
+
+    const validRoles = [
+      "police", "forensic", "prosecutor", "defense", "court",
+    ];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({
+        message: `Invalid role. Must be one of: ${validRoles.join(", ")}`,
+      });
+    }
+
+    // ── Step 1: Set Firebase custom claim ────────────────────
+    // This is what the Flutter app reads from the ID token
+    await admin.auth().setCustomUserClaims(uid, { role });
+    console.log(`✅ Set custom claim role="${role}" for uid=${uid}`);
+
+    // ── Step 2: Save/update in MongoDB ───────────────────────
+    const user = await User.findOneAndUpdate(
+      { uid },
+      { uid, name: name || email.split("@")[0], email, role },
+      { upsert: true, new: true }
+    );
+
+    // ── Step 3: Revoke existing tokens so claim takes effect ──
+    // This forces the user to get a new token with the role claim
+    await admin.auth().revokeRefreshTokens(uid);
+
+    res.status(201).json({
+      message: "User created successfully",
+      user: { uid, name: user.name, email, role },
+    });
+  } catch (err) {
+    console.error("createUser error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+/**
+ * GET /api/user/me
+ * Returns current user's profile + role from MongoDB.
+ */
+exports.getMe = async (req, res) => {
+  try {
+    const user = await User.findOne({ uid: req.user.uid });
+    if (!user) {
+      // User exists in Firebase but not MongoDB — create record
+      return res.json({
+        uid:   req.user.uid,
+        email: req.user.email || "",
+        role:  req.user.role  || "police",
+        name:  req.user.name  || "",
+      });
+    }
+    res.json({
+      uid:   user.uid,
+      email: user.email,
+      role:  user.role,
+      name:  user.name,
+    });
+  } catch (err) {
+    console.error("getMe error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+/**
+ * PATCH /api/user/role
+ * Update a user's role (admin use).
+ * Body: { uid, role }
+ */
+exports.updateRole = async (req, res) => {
+  try {
+    const { uid, role } = req.body;
+    const validRoles = [
+      "police", "forensic", "prosecutor", "defense", "court",
+    ];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ message: "Invalid role" });
+    }
+
+    // Update Firebase custom claim
+    await admin.auth().setCustomUserClaims(uid, { role });
+    await admin.auth().revokeRefreshTokens(uid);
+
+    // Update MongoDB
+    await User.findOneAndUpdate({ uid }, { role });
+
+    res.json({ message: "Role updated", uid, role });
+  } catch (err) {
+    console.error("updateRole error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+```
+
+---
+
+=== src/controllers/caseController.js ===
+```javascript
+const Case = require("../models/Case");
+
+/**
+ * POST /api/cases
+ * Create a new investigation case.
+ * Body: { title, description, priority, caseType, location, caseRef, incidentDate }
+ */
+exports.createCase = async (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      priority,
+      caseType,
+      location,
+      caseRef,
+      incidentDate,
+    } = req.body;
+
+    if (!title || !title.trim()) {
+      return res.status(400).json({ message: "Title is required" });
+    }
+
+    const newCase = new Case({
+      title:        title.trim(),
+      description:  description?.trim() || "",
+      priority:     priority     || "medium",
+      caseType:     caseType     || "criminal",
+      location:     location     || "",
+      caseRef:      caseRef      || "",
+      incidentDate: incidentDate ? new Date(incidentDate) : new Date(),
+      createdBy:    req.user.uid,   // from Firebase token
+      status:       "open",
+    });
+
+    await newCase.save();
+
+    res.status(201).json({
+      message: "Case created successfully",
+      case: newCase,
+    });
+  } catch (err) {
+    console.error("createCase error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+/**
+ * GET /api/cases
+ * Get all cases (sorted newest first).
+ */
+exports.getAllCases = async (req, res) => {
+  try {
+    const cases = await Case.find().sort({ createdAt: -1 });
+    res.json(cases);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+/**
+ * GET /api/cases/:id
+ * Get a single case by MongoDB ID.
+ */
+exports.getCaseById = async (req, res) => {
+  try {
+    const c = await Case.findById(req.params.id);
+    if (!c) return res.status(404).json({ message: "Case not found" });
+    res.json(c);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+/**
+ * PATCH /api/cases/:id/status
+ * Update case status.
+ * Body: { status: "open" | "closed" | "under_review" }
+ */
+exports.updateCaseStatus = async (req, res) => {
+  try {
+    const { status } = req.body;
+    const valid = ["open", "closed", "under_review"];
+    
+    if (!valid.includes(status)) {
+      return res.status(400).json({ message: "Invalid status" });
+    }
+    
+    const updated = await Case.findByIdAndUpdate(
+      req.params.id,
+      { status },
+      { new: true }
+    );
+    
+    if (!updated) return res.status(404).json({ message: "Case not found" });
+    
+    res.json({ 
+      message: "Status updated successfully", 
+      case: updated 
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+/**
+ * PATCH /api/cases/:id
+ * Update case details (all fields).
+ * Body: { title, description, priority, caseType, location, caseRef, incidentDate, status }
+ */
+exports.updateCase = async (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      priority,
+      caseType,
+      location,
+      caseRef,
+      incidentDate,
+      status
+    } = req.body;
+
+    // Build update object with only provided fields
+    const updateData = {};
+    
+    if (title) updateData.title = title.trim();
+    if (description !== undefined) updateData.description = description?.trim() || "";
+    if (priority) updateData.priority = priority;
+    if (caseType) updateData.caseType = caseType;
+    if (location !== undefined) updateData.location = location || "";
+    if (caseRef !== undefined) updateData.caseRef = caseRef || "";
+    if (incidentDate) updateData.incidentDate = new Date(incidentDate);
+    if (status) {
+      const valid = ["open", "closed", "under_review"];
+      if (!valid.includes(status)) {
+        return res.status(400).json({ message: "Invalid status" });
+      }
+      updateData.status = status;
+    }
+
+    const updated = await Case.findByIdAndUpdate(
+      req.params.id,
+      updateData,
+      { new: true, runValidators: true }
+    );
+
+    if (!updated) return res.status(404).json({ message: "Case not found" });
+
+    res.json({
+      message: "Case updated successfully",
+      case: updated
+    });
+  } catch (err) {
+    console.error("updateCase error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+/**
+ * DELETE /api/cases/:id
+ * Delete a case (optional - use with caution).
+ */
+exports.deleteCase = async (req, res) => {
+  try {
+    const deleted = await Case.findByIdAndDelete(req.params.id);
+    
+    if (!deleted) return res.status(404).json({ message: "Case not found" });
+    
+    res.json({ 
+      message: "Case deleted successfully",
+      case: deleted 
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+/**
+ * GET /api/cases/stats
+ * Get case statistics for dashboard.
+ */
+exports.getCaseStats = async (req, res) => {
+  try {
+    const total = await Case.countDocuments();
+    const open = await Case.countDocuments({ status: "open" });
+    const closed = await Case.countDocuments({ status: "closed" });
+    const underReview = await Case.countDocuments({ status: "under_review" });
+    
+    // Priority breakdown
+    const low = await Case.countDocuments({ priority: "low" });
+    const medium = await Case.countDocuments({ priority: "medium" });
+    const high = await Case.countDocuments({ priority: "high" });
+    const critical = await Case.countDocuments({ priority: "critical" });
+
+    // Case type breakdown
+    const criminal = await Case.countDocuments({ caseType: "criminal" });
+    const civil = await Case.countDocuments({ caseType: "civil" });
+    const cyber = await Case.countDocuments({ caseType: "cyber" });
+    const fraud = await Case.countDocuments({ caseType: "fraud" });
+    const narcotics = await Case.countDocuments({ caseType: "narcotics" });
+    const other = await Case.countDocuments({ caseType: "other" });
+
+    res.json({
+      total,
+      byStatus: { open, closed, underReview },
+      byPriority: { low, medium, high, critical },
+      byType: { criminal, civil, cyber, fraud, narcotics, other },
+      recentActivity: {
+        lastWeek: await Case.countDocuments({
+          createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
+        })
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+```
+
+---
+
+=== src/controllers/evidenceController.js ===
+```javascript
+// src/controllers/evidenceController.js
+const Evidence     = require("../models/Evidence");
+const Case         = require("../models/Case");
+const Custody      = require("../models/Custody");
+const generateHash = require("../services/hashService");
+const { anchorHash, verifyOnChain } = require("../services/blockchainService");
+const { sendTamperAlert }           = require("../services/alertService");
+const { bucket }                    = require("../config/firebase");
+const path                          = require("path");
+const { v4: uuidv4 }               = require("uuid");
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/evidence/upload
+// Upload NEW evidence for a case (can upload multiple per case)
+// ─────────────────────────────────────────────────────────────
+exports.uploadEvidence = async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) return res.status(400).json({ message: "No file uploaded" });
+
+    const { caseId, description, evidenceType } = req.body;
+    if (!caseId) return res.status(400).json({ message: "caseId is required" });
+
+    const existingCase = await Case.findById(caseId);
+    if (!existingCase) return res.status(404).json({ message: "Case not found" });
+
+    // Hash from file bytes
+    const hash         = generateHash(file.buffer);
+    const fileExt      = path.extname(file.originalname);
+    const safeFileName = `${Date.now()}_${uuidv4().slice(0, 8)}${fileExt}`;
+    const storagePath  = `evidence/${caseId}/${safeFileName}`;
+    const fileUpload   = bucket.file(storagePath);
+
+    // Upload to Firebase Storage
+    await new Promise((resolve, reject) => {
+      const stream = fileUpload.createWriteStream({
+        metadata: {
+          contentType: file.mimetype,
+          metadata: {
+            evidenceCaseId:   caseId,
+            uploadedBy:       req.user.uid,
+            sha256Hash:       hash,
+            originalFileName: file.originalname,
+          },
+        },
+        resumable: false,
+      });
+      stream.on("error", reject);
+      stream.on("finish", resolve);
+      stream.end(file.buffer);
+    });
+
+    // Generate proper Firebase Storage download URL
+    // Uses firebasestorage.googleapis.com format with encoded path
+    // This is the correct URL that works in browsers with no CORS issues
+    const encodedPath = encodeURIComponent(storagePath);
+    const downloadURL =
+      `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodedPath}?alt=media`;
+
+    const evidence = new Evidence({
+      caseId,
+      fileName:         file.originalname,
+      fileType:         file.mimetype,
+      fileSize:         file.size,
+      fileHash:         hash,
+      storagePath,
+      downloadURL,
+      uploadedBy:       req.user.uid,
+      description:      description || "",
+      evidenceType:     evidenceType || _detectType(file.mimetype),
+      blockchainStatus: "pending",
+      isTampered:       false,
+    });
+
+    await evidence.save();
+
+    // Anchor on blockchain (background)
+    anchorHash(evidence._id.toString(), hash)
+      .then(async (txHash) => {
+        await Evidence.findByIdAndUpdate(evidence._id, {
+          blockchainTxHash: txHash,
+          blockchainStatus: "anchored",
+          anchoredAt:       new Date(),
+        });
+        console.log(`✅ Anchored ${evidence._id} TX: ${txHash}`);
+      })
+      .catch(async (err) => {
+        await Evidence.findByIdAndUpdate(evidence._id, {
+          blockchainStatus: "failed",
+        });
+        console.error(`❌ Anchor failed:`, err.message);
+      });
+
+    res.status(201).json({
+      message:          "Evidence uploaded successfully",
+      evidenceId:       evidence._id,
+      fileName:         evidence.fileName,
+      fileHash:         hash,
+      downloadURL,
+      blockchainStatus: "pending",
+    });
+  } catch (err) {
+    console.error("uploadEvidence error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/evidence/verify
+// Re-upload a file to check if it matches the stored hash.
+// If tampered → update DB isTampered=true, send alert.
+// ─────────────────────────────────────────────────────────────
+exports.verifyEvidence = async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) return res.status(400).json({ message: "No file uploaded" });
+
+    const { evidenceId } = req.body;
+    if (!evidenceId) {
+      return res.status(400).json({ message: "evidenceId is required" });
+    }
+
+    const stored = await Evidence.findById(evidenceId);
+    if (!stored) {
+      return res.status(404).json({ message: "Evidence record not found" });
+    }
+
+    // Compute hash of uploaded file
+    const newHash  = generateHash(file.buffer);
+    const dbMatch  = newHash === stored.fileHash;
+
+    // Verify on blockchain if anchored
+    let chainResult = { valid: null };
+    if (stored.blockchainStatus === "anchored") {
+      try {
+        chainResult = await verifyOnChain(evidenceId, newHash);
+      } catch (e) {
+        console.error("Chain verify error:", e.message);
+      }
+    }
+
+    const isTampered = !dbMatch || chainResult.valid === false;
+
+    if (isTampered) {
+      // ── REFLECT TAMPER IN DATABASE ────────────────────────
+      await Evidence.findByIdAndUpdate(evidenceId, {
+        isTampered:   true,
+        tamperedAt:   new Date(),
+        tamperSource: "manual_verify",
+        // Store the hash that was submitted (the modified one)
+        tamperedHash: newHash,
+      });
+
+      // Send alert
+      await sendTamperAlert({
+        evidenceId,
+        fileName:     stored.fileName,
+        originalHash: stored.fileHash,
+        newHash,
+        detectedBy:   req.user.uid,
+        caseId:       stored.caseId,
+      });
+
+      console.warn(
+        `🚨 TAMPER DETECTED: evidenceId=${evidenceId} ` +
+        `file="${stored.fileName}" caseId=${stored.caseId}`
+      );
+
+      return res.json({
+        status:          "TAMPERED",
+        message:         "Evidence integrity COMPROMISED",
+        evidenceId,
+        fileName:        stored.fileName,
+        caseId:          stored.caseId,
+        originalHash:    stored.fileHash,
+        newHash,
+        hashMatch:       false,
+        blockchainValid: chainResult.valid,
+        detectedAt:      new Date().toISOString(),
+        // Tell frontend to update the UI
+        dbUpdated:       true,
+      });
+    }
+
+    // ── FILE IS CLEAN ─────────────────────────────────────────
+    // If previously tampered but now OK — clear the flag
+    if (stored.isTampered) {
+      await Evidence.findByIdAndUpdate(evidenceId, {
+        isTampered:   false,
+        tamperedAt:   null,
+        tamperSource: null,
+        tamperedHash: null,
+      });
+    }
+
+    res.json({
+      status:           "VERIFIED",
+      message:          "Evidence integrity CONFIRMED",
+      evidenceId,
+      fileName:         stored.fileName,
+      caseId:           stored.caseId,
+      hash:             newHash,
+      hashMatch:        true,
+      blockchainValid:  chainResult.valid,
+      anchoredAt:       stored.anchoredAt,
+      blockchainTxHash: stored.blockchainTxHash,
+      dbUpdated:        stored.isTampered, // true if we cleared a previous tamper
+    });
+  } catch (err) {
+    console.error("verifyEvidence error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/evidence/stats
+// ─────────────────────────────────────────────────────────────
+exports.getStats = async (req, res) => {
+  try {
+    const [totalCases, totalEvidence, anchored, tampered] =
+      await Promise.all([
+        Case.countDocuments(),
+        Evidence.countDocuments(),
+        Evidence.countDocuments({ blockchainStatus: "anchored" }),
+        Evidence.countDocuments({ isTampered: true }),
+      ]);
+
+    res.json({
+      totalCases, totalEvidence, anchored, tampered,
+      successRate: totalEvidence > 0
+        ? ((anchored / totalEvidence) * 100).toFixed(1) : "0.0",
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/evidence/cases-with-evidence
+// Returns all cases with their evidence grouped — for Evidence List screen
+// ─────────────────────────────────────────────────────────────
+exports.getCasesWithEvidence = async (req, res) => {
+  try {
+    // Get all cases
+    const cases = await Case.find().sort({ createdAt: -1 }).lean();
+
+    // Get evidence counts and tamper info per case
+    const evidenceGroups = await Evidence.aggregate([
+      {
+        $group: {
+          _id:       "$caseId",
+          total:     { $sum: 1 },
+          anchored:  { $sum: { $cond: [{ $eq: ["$blockchainStatus","anchored"] }, 1, 0] } },
+          tampered:  { $sum: { $cond: ["$isTampered", 1, 0] } },
+          totalSize: { $sum: "$fileSize" },
+          latest:    { $max: "$createdAt" },
+        },
+      },
+    ]);
+
+    // Map for quick lookup
+    const groupMap = {};
+    for (const g of evidenceGroups) {
+      groupMap[g._id] = g;
+    }
+
+    // Merge
+    const result = cases.map((c) => ({
+      ...c,
+      evidenceStats: groupMap[c._id.toString()] || {
+        total: 0, anchored: 0, tampered: 0,
+        totalSize: 0, latest: null,
+      },
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error("getCasesWithEvidence error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/evidence/case/:caseId
+// Get all evidence for a specific case — FULL data including downloadURL
+// ─────────────────────────────────────────────────────────────
+exports.getEvidenceByCase = async (req, res) => {
+  try {
+    const evidence = await Evidence
+      .find({ caseId: req.params.caseId })
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json(evidence);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/evidence/recent-activity
+// ─────────────────────────────────────────────────────────────
+exports.getRecentActivity = async (req, res) => {
+  try {
+    const recentEvidence = await Evidence
+      .find()
+      .sort({ createdAt: -1 })
+      .limit(6)
+      .select("fileName blockchainStatus blockchainTxHash fileHash createdAt caseId uploadedBy isTampered evidenceType fileSize")
+      .lean();
+
+    const recentCustody = await Custody
+      .find()
+      .sort({ timestamp: -1 })
+      .limit(4)
+      .select("evidenceId fromUser toUser reason timestamp")
+      .lean();
+
+    res.json({ recentEvidence, recentCustody });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/evidence/stats-summary
+// ─────────────────────────────────────────────────────────────
+exports.getSummary = async (req, res) => {
+  try {
+    const summary = await Evidence.aggregate([
+      {
+        $group: {
+          _id:      "$caseId",
+          total:    { $sum: 1 },
+          anchored: { $sum: { $cond: [{ $eq: ["$blockchainStatus","anchored"] },1,0] } },
+          pending:  { $sum: { $cond: [{ $eq: ["$blockchainStatus","pending"]  },1,0] } },
+          failed:   { $sum: { $cond: [{ $eq: ["$blockchainStatus","failed"]   },1,0] } },
+          tampered: { $sum: { $cond: ["$isTampered", 1, 0] } },
+        },
+      },
+      { $sort: { total: -1 } },
+    ]);
+    res.json(summary);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/evidence/recent/:limit
+// ─────────────────────────────────────────────────────────────
+exports.getRecentEvidence = async (req, res) => {
+  try {
+    const limit = parseInt(req.params.limit) || 10;
+    const evidence = await Evidence
+      .find()
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+    res.json(evidence);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/evidence/:id
+// ─────────────────────────────────────────────────────────────
+exports.getEvidenceById = async (req, res) => {
+  try {
+    const evidence = await Evidence.findById(req.params.id);
+    if (!evidence) return res.status(404).json({ message: "Not found" });
+    res.json(evidence);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+function _detectType(mime) {
+  if (!mime) return "document";
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  if (mime === "application/pdf") return "document";
+  return "document";
+}
+```
+
+---
+
+=== src/controllers/custodyController.js ===
+```javascript
+// src/controllers/custodyController.js
+const Custody  = require("../models/Custody");
+const Evidence = require("../models/Evidence");
+const Case     = require("../models/Case");
+const { admin } = require("../config/firebase");
+
+// ── Role display labels ───────────────────────────────────────────────
+const ROLE_LABELS = {
+  police:     "Police Officer",
+  forensic:   "Forensic Expert",
+  prosecutor: "Prosecutor",
+  defense:    "Defense Attorney",
+  court:      "Court Official",
+};
+
+// ── Which roles can transfer to which roles ───────────────────────────
+const ALLOWED_TRANSFERS = {
+  police:     ["forensic", "prosecutor"],
+  forensic:   ["prosecutor", "police"],
+  prosecutor: ["defense", "court"],
+  defense:    ["court"],
+  court:      [],
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// POST /api/custody/transfer
+// ─────────────────────────────────────────────────────────────────────
+exports.transferCustody = async (req, res) => {
+  try {
+    const {
+      evidenceId,
+      toUser,    // target user UID or email
+      toRole,    // target role
+      reason,
+      notes,
+    } = req.body;
+
+    if (!evidenceId || !toUser || !toRole || !reason) {
+      return res.status(400).json({
+        message: "evidenceId, toUser, toRole, and reason are required",
+      });
+    }
+
+    // Check evidence exists
+    const evidence = await Evidence.findById(evidenceId);
+    if (!evidence) {
+      return res.status(404).json({ message: "Evidence not found" });
+    }
+
+    const fromRole = req.user.role || "police";
+
+    // Validate toRole is a known role
+    if (!ROLE_LABELS[toRole]) {
+      return res.status(400).json({
+        message: `Invalid toRole: ${toRole}. Must be one of: ${Object.keys(ROLE_LABELS).join(", ")}`,
+      });
+    }
+
+    // Check transfer is allowed for this role
+    const allowed = ALLOWED_TRANSFERS[fromRole] || [];
+    if (!allowed.includes(toRole)) {
+      return res.status(403).json({
+        message: `${ROLE_LABELS[fromRole] || fromRole} cannot transfer to ${ROLE_LABELS[toRole]}. Allowed: ${allowed.map(r => ROLE_LABELS[r]).join(", ") || "none"}`,
+        allowedRoles: allowed,
+      });
+    }
+
+    // Get chain position (count existing transfers + 1)
+    const existingCount = await Custody.countDocuments({ evidenceId });
+
+    // Get sender info
+    const fromName = req.user.email || req.user.uid;
+
+    // Get receiver display name
+    let toName = toUser;
+    try {
+      // Try to look up by UID first
+      const userRecord = await admin.auth().getUser(toUser).catch(() => null);
+      if (userRecord) {
+        toName = userRecord.email || userRecord.displayName || toUser;
+      }
+    } catch (_) {}
+
+    // Create custody record
+    const custody = await Custody.create({
+      evidenceId,
+      caseId:         evidence.caseId,
+      evidenceName:   evidence.fileName,
+      fromUser:       req.user.uid,
+      fromRole,
+      fromName,
+      toUser,
+      toRole,
+      toName,
+      reason,
+      notes:          notes || "",
+      chainPosition:  existingCount + 1,
+      hashAtTransfer: evidence.fileHash,
+    });
+
+    res.status(201).json({
+      message:   "Custody transferred successfully",
+      custodyId: custody._id,
+      from:      { uid: req.user.uid, role: fromRole, name: fromName },
+      to:        { uid: toUser, role: toRole, name: toName },
+      timestamp: custody.timestamp,
+      chainPosition: custody.chainPosition,
+    });
+  } catch (err) {
+    console.error("transferCustody error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// GET /api/custody/history/:evidenceId
+// Full chain of custody for one evidence item
+// ─────────────────────────────────────────────────────────────────────
+exports.getCustodyHistory = async (req, res) => {
+  try {
+    const { evidenceId } = req.params;
+
+    const [evidence, records] = await Promise.all([
+      Evidence.findById(evidenceId).lean(),
+      Custody.find({ evidenceId }).sort({ timestamp: 1 }).lean(),
+    ]);
+
+    if (!evidence) {
+      return res.status(404).json({ message: "Evidence not found" });
+    }
+
+    // Build the full chain starting from upload
+    const chain = [
+      {
+        type:      "upload",
+        actor:     evidence.uploadedBy,
+        actorRole: "police",
+        action:    "Evidence uploaded & registered",
+        hash:      evidence.fileHash,
+        timestamp: evidence.createdAt,
+        txHash:    evidence.blockchainTxHash,
+        status:    evidence.blockchainStatus,
+        position:  0,
+      },
+      ...records.map((r, i) => ({
+        type:         "transfer",
+        custodyId:    r._id,
+        fromUser:     r.fromUser,
+        fromRole:     r.fromRole,
+        fromName:     r.fromName,
+        toUser:       r.toUser,
+        toRole:       r.toRole,
+        toName:       r.toName,
+        reason:       r.reason,
+        notes:        r.notes,
+        hash:         r.hashAtTransfer,
+        timestamp:    r.timestamp,
+        position:     r.chainPosition,
+      })),
+    ];
+
+    // Add tamper info if applicable
+    const tamperInfo = evidence.isTampered
+      ? {
+          isTampered:   true,
+          tamperedAt:   evidence.tamperedAt,
+          tamperSource: evidence.tamperSource,
+          tamperedHash: evidence.tamperedHash,
+        }
+      : { isTampered: false };
+
+    res.json({
+      evidence: {
+        id:              evidence._id,
+        fileName:        evidence.fileName,
+        fileHash:        evidence.fileHash,
+        blockchainStatus: evidence.blockchainStatus,
+        blockchainTxHash: evidence.blockchainTxHash,
+        uploadedBy:      evidence.uploadedBy,
+        caseId:          evidence.caseId,
+        createdAt:       evidence.createdAt,
+        ...tamperInfo,
+      },
+      chain,
+      totalTransfers: records.length,
+      currentCustodian: records.length > 0
+        ? {
+            user: records[records.length - 1].toUser,
+            role: records[records.length - 1].toRole,
+            name: records[records.length - 1].toName,
+          }
+        : {
+            user: evidence.uploadedBy,
+            role: "police",
+            name: evidence.uploadedBy,
+          },
+    });
+  } catch (err) {
+    console.error("getCustodyHistory error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// GET /api/custody/case/:caseId
+// All custody transfers for all evidence in a case
+// ─────────────────────────────────────────────────────────────────────
+exports.getCustodyByCase = async (req, res) => {
+  try {
+    const { caseId } = req.params;
+
+    const [caseData, records] = await Promise.all([
+      Case.findById(caseId).lean(),
+      Custody.find({ caseId }).sort({ timestamp: -1 }).lean(),
+    ]);
+
+    if (!caseData) {
+      return res.status(404).json({ message: "Case not found" });
+    }
+
+    res.json({
+      case:    caseData,
+      records,
+      total:   records.length,
+    });
+  } catch (err) {
+    console.error("getCustodyByCase error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// GET /api/custody/allowed-roles
+// Returns which roles the current user can transfer to
+// ─────────────────────────────────────────────────────────────────────
+exports.getAllowedRoles = async (req, res) => {
+  const role    = req.user.role || "police";
+  const allowed = ALLOWED_TRANSFERS[role] || [];
+  res.json({
+    currentRole:  role,
+    allowedRoles: allowed.map((r) => ({
+      value: r,
+      label: ROLE_LABELS[r],
+    })),
+  });
+};
+```
+
+---
+
+**Note:** The `package-lock.json` file is very large (over 9000 lines) containing detailed npm dependency information. It has been excluded from this output as it is auto-generated and not typically read manually. The file exists in the project and contains all locked dependency versions.
