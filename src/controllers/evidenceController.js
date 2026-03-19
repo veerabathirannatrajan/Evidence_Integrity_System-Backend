@@ -1,4 +1,9 @@
 // src/controllers/evidenceController.js
+// FIX: anchorHash is now AWAITED synchronously before res.json()
+//      so it works on Vercel (serverless functions are killed after response).
+// NEW: exports.retryAnchor — POST /api/evidence/anchor/:id
+//      retries anchoring for pending/failed records from the Flutter app.
+
 const Evidence     = require("../models/Evidence");
 const Case         = require("../models/Case");
 const Custody      = require("../models/Custody");
@@ -11,7 +16,6 @@ const { v4: uuidv4 }               = require("uuid");
 
 // ─────────────────────────────────────────────────────────────
 // POST /api/evidence/upload
-// Upload NEW evidence for a case (can upload multiple per case)
 // ─────────────────────────────────────────────────────────────
 exports.uploadEvidence = async (req, res) => {
   try {
@@ -24,14 +28,14 @@ exports.uploadEvidence = async (req, res) => {
     const existingCase = await Case.findById(caseId);
     if (!existingCase) return res.status(404).json({ message: "Case not found" });
 
-    // Hash from file bytes
+    // ── 1. Hash ───────────────────────────────────────────────
     const hash         = generateHash(file.buffer);
     const fileExt      = path.extname(file.originalname);
     const safeFileName = `${Date.now()}_${uuidv4().slice(0, 8)}${fileExt}`;
     const storagePath  = `evidence/${caseId}/${safeFileName}`;
     const fileUpload   = bucket.file(storagePath);
 
-    // Upload to Firebase Storage
+    // ── 2. Upload to Firebase Storage ────────────────────────
     await new Promise((resolve, reject) => {
       const stream = fileUpload.createWriteStream({
         metadata: {
@@ -50,13 +54,12 @@ exports.uploadEvidence = async (req, res) => {
       stream.end(file.buffer);
     });
 
-    // Generate proper Firebase Storage download URL
-    // Uses firebasestorage.googleapis.com format with encoded path
-    // This is the correct URL that works in browsers with no CORS issues
+    // ── 3. Download URL ───────────────────────────────────────
     const encodedPath = encodeURIComponent(storagePath);
     const downloadURL =
       `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodedPath}?alt=media`;
 
+    // ── 4. Save evidence record (pending) ────────────────────
     const evidence = new Evidence({
       caseId,
       fileName:         file.originalname,
@@ -74,30 +77,49 @@ exports.uploadEvidence = async (req, res) => {
 
     await evidence.save();
 
-    // Anchor on blockchain (background)
-    anchorHash(evidence._id.toString(), hash)
-      .then(async (txHash) => {
-        await Evidence.findByIdAndUpdate(evidence._id, {
-          blockchainTxHash: txHash,
-          blockchainStatus: "anchored",
-          anchoredAt:       new Date(),
-        });
-        console.log(`✅ Anchored ${evidence._id} TX: ${txHash}`);
-      })
-      .catch(async (err) => {
-        await Evidence.findByIdAndUpdate(evidence._id, {
-          blockchainStatus: "failed",
-        });
-        console.error(`❌ Anchor failed:`, err.message);
+    // ── 5. Anchor on blockchain — NOW AWAITED ─────────────────
+    // Previously used fire-and-forget .then() which Vercel kills
+    // as soon as res.json() is called. Now we await before responding.
+    let blockchainTxHash = null;
+    let blockchainStatus = "pending";
+
+    try {
+      const txHash = await anchorHash(evidence._id.toString(), hash);
+
+      blockchainTxHash = txHash;
+      blockchainStatus = "anchored";
+
+      await Evidence.findByIdAndUpdate(evidence._id, {
+        blockchainTxHash: txHash,
+        blockchainStatus: "anchored",
+        anchoredAt:       new Date(),
       });
 
-    res.status(201).json({
-      message:          "Evidence uploaded successfully",
+      console.log(`✅ Anchored ${evidence._id}  TX: ${txHash}`);
+    } catch (anchorErr) {
+      // Anchoring failed — mark DB, still return 201 so file is saved.
+      // Flutter can call POST /api/evidence/anchor/:id to retry.
+      blockchainStatus = "failed";
+
+      await Evidence.findByIdAndUpdate(evidence._id, {
+        blockchainStatus: "failed",
+      });
+
+      console.error(`❌ Anchor failed for ${evidence._id}:`, anchorErr.message);
+    }
+
+    // ── 6. Respond ────────────────────────────────────────────
+    return res.status(201).json({
+      message:
+        blockchainStatus === "anchored"
+          ? "Evidence uploaded and anchored on blockchain"
+          : "Evidence uploaded — blockchain anchor failed (use retry endpoint)",
       evidenceId:       evidence._id,
       fileName:         evidence.fileName,
       fileHash:         hash,
       downloadURL,
-      blockchainStatus: "pending",
+      blockchainStatus,
+      blockchainTxHash,
     });
   } catch (err) {
     console.error("uploadEvidence error:", err);
@@ -106,9 +128,52 @@ exports.uploadEvidence = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
+// POST /api/evidence/anchor/:id          ← NEW ENDPOINT
+// Retry blockchain anchoring for a pending/failed evidence record.
+// Flutter calls this when blockchainStatus is "pending" or "failed".
+// ─────────────────────────────────────────────────────────────
+exports.retryAnchor = async (req, res) => {
+  try {
+    const ev = await Evidence.findById(req.params.id);
+    if (!ev) return res.status(404).json({ message: "Evidence not found" });
+
+    // Already done — just return the existing tx
+    if (ev.blockchainStatus === "anchored") {
+      return res.json({
+        message:          "Already anchored",
+        evidenceId:       ev._id,
+        blockchainStatus: "anchored",
+        blockchainTxHash: ev.blockchainTxHash,
+        anchoredAt:       ev.anchoredAt,
+      });
+    }
+
+    console.log(`🔄 Retrying anchor for evidence ${ev._id} …`);
+
+    const txHash = await anchorHash(ev._id.toString(), ev.fileHash);
+
+    await Evidence.findByIdAndUpdate(ev._id, {
+      blockchainTxHash: txHash,
+      blockchainStatus: "anchored",
+      anchoredAt:       new Date(),
+    });
+
+    console.log(`✅ Retry anchored ${ev._id}  TX: ${txHash}`);
+
+    return res.json({
+      message:          "Anchored successfully",
+      evidenceId:       ev._id,
+      blockchainStatus: "anchored",
+      blockchainTxHash: txHash,
+    });
+  } catch (err) {
+    console.error("retryAnchor error:", err);
+    res.status(500).json({ message: "Anchor failed", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
 // POST /api/evidence/verify
-// Re-upload a file to check if it matches the stored hash.
-// If tampered → update DB isTampered=true, send alert.
 // ─────────────────────────────────────────────────────────────
 exports.verifyEvidence = async (req, res) => {
   try {
@@ -125,11 +190,9 @@ exports.verifyEvidence = async (req, res) => {
       return res.status(404).json({ message: "Evidence record not found" });
     }
 
-    // Compute hash of uploaded file
     const newHash  = generateHash(file.buffer);
     const dbMatch  = newHash === stored.fileHash;
 
-    // Verify on blockchain if anchored
     let chainResult = { valid: null };
     if (stored.blockchainStatus === "anchored") {
       try {
@@ -142,16 +205,13 @@ exports.verifyEvidence = async (req, res) => {
     const isTampered = !dbMatch || chainResult.valid === false;
 
     if (isTampered) {
-      // ── REFLECT TAMPER IN DATABASE ────────────────────────
       await Evidence.findByIdAndUpdate(evidenceId, {
         isTampered:   true,
         tamperedAt:   new Date(),
         tamperSource: "manual_verify",
-        // Store the hash that was submitted (the modified one)
         tamperedHash: newHash,
       });
 
-      // Send alert
       await sendTamperAlert({
         evidenceId,
         fileName:     stored.fileName,
@@ -177,13 +237,10 @@ exports.verifyEvidence = async (req, res) => {
         hashMatch:       false,
         blockchainValid: chainResult.valid,
         detectedAt:      new Date().toISOString(),
-        // Tell frontend to update the UI
         dbUpdated:       true,
       });
     }
 
-    // ── FILE IS CLEAN ─────────────────────────────────────────
-    // If previously tampered but now OK — clear the flag
     if (stored.isTampered) {
       await Evidence.findByIdAndUpdate(evidenceId, {
         isTampered:   false,
@@ -193,7 +250,7 @@ exports.verifyEvidence = async (req, res) => {
       });
     }
 
-    res.json({
+    return res.json({
       status:           "VERIFIED",
       message:          "Evidence integrity CONFIRMED",
       evidenceId,
@@ -204,7 +261,7 @@ exports.verifyEvidence = async (req, res) => {
       blockchainValid:  chainResult.valid,
       anchoredAt:       stored.anchoredAt,
       blockchainTxHash: stored.blockchainTxHash,
-      dbUpdated:        stored.isTampered, // true if we cleared a previous tamper
+      dbUpdated:        stored.isTampered,
     });
   } catch (err) {
     console.error("verifyEvidence error:", err);
@@ -237,14 +294,11 @@ exports.getStats = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // GET /api/evidence/cases-with-evidence
-// Returns all cases with their evidence grouped — for Evidence List screen
 // ─────────────────────────────────────────────────────────────
 exports.getCasesWithEvidence = async (req, res) => {
   try {
-    // Get all cases
     const cases = await Case.find().sort({ createdAt: -1 }).lean();
 
-    // Get evidence counts and tamper info per case
     const evidenceGroups = await Evidence.aggregate([
       {
         $group: {
@@ -258,13 +312,11 @@ exports.getCasesWithEvidence = async (req, res) => {
       },
     ]);
 
-    // Map for quick lookup
     const groupMap = {};
     for (const g of evidenceGroups) {
       groupMap[g._id] = g;
     }
 
-    // Merge
     const result = cases.map((c) => ({
       ...c,
       evidenceStats: groupMap[c._id.toString()] || {
@@ -282,7 +334,6 @@ exports.getCasesWithEvidence = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // GET /api/evidence/case/:caseId
-// Get all evidence for a specific case — FULL data including downloadURL
 // ─────────────────────────────────────────────────────────────
 exports.getEvidenceByCase = async (req, res) => {
   try {
@@ -322,7 +373,7 @@ exports.getRecentActivity = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/evidence/stats-summary
+// GET /api/evidence/summary
 // ─────────────────────────────────────────────────────────────
 exports.getSummary = async (req, res) => {
   try {
@@ -363,7 +414,7 @@ exports.getRecentEvidence = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/evidence/:id
+// GET /api/evidence/:id   (also used for public QR)
 // ─────────────────────────────────────────────────────────────
 exports.getEvidenceById = async (req, res) => {
   try {
@@ -375,6 +426,9 @@ exports.getEvidenceById = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────
+// HELPER
+// ─────────────────────────────────────────────────────────────
 function _detectType(mime) {
   if (!mime) return "document";
   if (mime.startsWith("image/")) return "image";

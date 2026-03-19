@@ -49,11 +49,18 @@ exports.transferCustody = async (req, res) => {
 
     const fromRole = req.user.role || "police";
 
-    // Check transfer is allowed
+    // Validate toRole is a known role
+    if (!ROLE_LABELS[toRole]) {
+      return res.status(400).json({
+        message: `Invalid toRole: ${toRole}. Must be one of: ${Object.keys(ROLE_LABELS).join(", ")}`,
+      });
+    }
+
+    // Check transfer is allowed for this role
     const allowed = ALLOWED_TRANSFERS[fromRole] || [];
     if (!allowed.includes(toRole)) {
       return res.status(403).json({
-        message: `${ROLE_LABELS[fromRole]} cannot transfer to ${ROLE_LABELS[toRole]}`,
+        message: `${ROLE_LABELS[fromRole] || fromRole} cannot transfer to ${ROLE_LABELS[toRole]}. Allowed: ${allowed.map(r => ROLE_LABELS[r]).join(", ") || "none"}`,
         allowedRoles: allowed,
       });
     }
