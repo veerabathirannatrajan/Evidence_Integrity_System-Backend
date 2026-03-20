@@ -3,7 +3,6 @@ Here is the complete content of all files in the evidence-backend project, organ
 ---
 
 === vercel.json ===
-```json
 {
   "version": 2,
   "builds": [
@@ -17,10 +16,13 @@ Here is the complete content of all files in the evidence-backend project, organ
       "src": "/(.*)",
       "dest": "src/server.js"
     }
-  ]
+  ],
+  "functions": {
+    "src/server.js": {
+      "maxDuration": 60
+    }
+  }
 }
-```
-
 ---
 
 === scripts/deploy.js ===
@@ -907,8 +909,9 @@ module.exports = router;
 ---
 
 === src/routes/evidenceRoutes.js ===
-```javascript
 // src/routes/evidenceRoutes.js
+// ADDED: POST /anchor/:id  — retry blockchain anchoring for pending/failed records
+
 const express  = require("express");
 const multer   = require("multer");
 const router   = express.Router();
@@ -927,23 +930,27 @@ router.get("/recent-activity",      auth, ctrl.getRecentActivity);
 router.get("/recent/:limit",        auth, ctrl.getRecentEvidence);
 router.get("/cases-with-evidence",  auth, ctrl.getCasesWithEvidence);
 
-// Public QR
+// Public QR — no auth so anyone with QR code can view
 router.get("/public/:id", ctrl.getEvidenceById);
 
 // Upload + Verify (multer required)
 router.post("/upload", auth, upload.single("file"), ctrl.uploadEvidence);
 router.post("/verify", auth, upload.single("file"), ctrl.verifyEvidence);
 
+// ── NEW: Retry blockchain anchor ──────────────────────────────
+// Called from Flutter when blockchainStatus is "pending" or "failed".
+// Must be declared BEFORE /:id so it is not swallowed by that pattern.
+// POST /api/evidence/anchor/:id
+router.post("/anchor/:id", auth, ctrl.retryAnchor);
+
 // By case
 router.get("/case/:caseId", auth, ctrl.getEvidenceByCase);
 
-// Single — ALWAYS last
-router.get("/:id", auth, ctrl.getEvidenceById);
-
-// ── File proxy — streams Firebase Storage files through backend ────
-// Bypasses CORS since browser requests same-origin backend URL
+// ── File proxy ────────────────────────────────────────────────
+// Streams Firebase Storage files through the backend.
+// Bypasses browser CORS since the request goes to the same-origin backend.
 // GET /api/evidence/image-proxy?path=evidence/caseId/filename
-// No auth needed — files are public (Storage rules: allow read: if true)
+// No auth — files are public (Storage rules: allow read: if true)
 router.get("/image-proxy", async (req, res) => {
   try {
     const { bucket } = require("../config/firebase");
@@ -956,17 +963,21 @@ router.get("/image-proxy", async (req, res) => {
 
     const [meta] = await file.getMetadata();
     const contentType = meta.contentType || "application/octet-stream";
-    const fileName = (meta.metadata && meta.metadata.originalFileName)
-        || filePath.split("/").pop() || "file";
+    const fileName =
+      (meta.metadata && meta.metadata.originalFileName) ||
+      filePath.split("/").pop() ||
+      "file";
 
     res.setHeader("Content-Type", contentType);
     res.setHeader("Cache-Control", "private, max-age=3600");
-    res.setHeader("Content-Disposition",
-        `inline; filename="${encodeURIComponent(fileName)}"`);
-    // CORS headers for browser
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${encodeURIComponent(fileName)}"`
+    );
     res.setHeader("Access-Control-Allow-Origin", "*");
 
-    file.createReadStream()
+    file
+      .createReadStream()
       .on("error", (err) => {
         if (!res.headersSent) res.status(500).end();
       })
@@ -977,9 +988,10 @@ router.get("/image-proxy", async (req, res) => {
   }
 });
 
-module.exports = router;
-```
+// Single evidence by ID — ALWAYS last so fixed routes are matched first
+router.get("/:id", auth, ctrl.getEvidenceById);
 
+module.exports = router;
 ---
 
 === src/routes/custodyRoutes.js ===
@@ -1640,8 +1652,12 @@ exports.getCaseStats = async (req, res) => {
 ---
 
 === src/controllers/evidenceController.js ===
-```javascript
 // src/controllers/evidenceController.js
+// FIX: anchorHash is now AWAITED synchronously before res.json()
+//      so it works on Vercel (serverless functions are killed after response).
+// NEW: exports.retryAnchor — POST /api/evidence/anchor/:id
+//      retries anchoring for pending/failed records from the Flutter app.
+
 const Evidence     = require("../models/Evidence");
 const Case         = require("../models/Case");
 const Custody      = require("../models/Custody");
@@ -1654,7 +1670,6 @@ const { v4: uuidv4 }               = require("uuid");
 
 // ─────────────────────────────────────────────────────────────
 // POST /api/evidence/upload
-// Upload NEW evidence for a case (can upload multiple per case)
 // ─────────────────────────────────────────────────────────────
 exports.uploadEvidence = async (req, res) => {
   try {
@@ -1667,14 +1682,14 @@ exports.uploadEvidence = async (req, res) => {
     const existingCase = await Case.findById(caseId);
     if (!existingCase) return res.status(404).json({ message: "Case not found" });
 
-    // Hash from file bytes
+    // ── 1. Hash ───────────────────────────────────────────────
     const hash         = generateHash(file.buffer);
     const fileExt      = path.extname(file.originalname);
     const safeFileName = `${Date.now()}_${uuidv4().slice(0, 8)}${fileExt}`;
     const storagePath  = `evidence/${caseId}/${safeFileName}`;
     const fileUpload   = bucket.file(storagePath);
 
-    // Upload to Firebase Storage
+    // ── 2. Upload to Firebase Storage ────────────────────────
     await new Promise((resolve, reject) => {
       const stream = fileUpload.createWriteStream({
         metadata: {
@@ -1693,13 +1708,12 @@ exports.uploadEvidence = async (req, res) => {
       stream.end(file.buffer);
     });
 
-    // Generate proper Firebase Storage download URL
-    // Uses firebasestorage.googleapis.com format with encoded path
-    // This is the correct URL that works in browsers with no CORS issues
+    // ── 3. Download URL ───────────────────────────────────────
     const encodedPath = encodeURIComponent(storagePath);
     const downloadURL =
       `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodedPath}?alt=media`;
 
+    // ── 4. Save evidence record (pending) ────────────────────
     const evidence = new Evidence({
       caseId,
       fileName:         file.originalname,
@@ -1717,30 +1731,49 @@ exports.uploadEvidence = async (req, res) => {
 
     await evidence.save();
 
-    // Anchor on blockchain (background)
-    anchorHash(evidence._id.toString(), hash)
-      .then(async (txHash) => {
-        await Evidence.findByIdAndUpdate(evidence._id, {
-          blockchainTxHash: txHash,
-          blockchainStatus: "anchored",
-          anchoredAt:       new Date(),
-        });
-        console.log(`✅ Anchored ${evidence._id} TX: ${txHash}`);
-      })
-      .catch(async (err) => {
-        await Evidence.findByIdAndUpdate(evidence._id, {
-          blockchainStatus: "failed",
-        });
-        console.error(`❌ Anchor failed:`, err.message);
+    // ── 5. Anchor on blockchain — NOW AWAITED ─────────────────
+    // Previously used fire-and-forget .then() which Vercel kills
+    // as soon as res.json() is called. Now we await before responding.
+    let blockchainTxHash = null;
+    let blockchainStatus = "pending";
+
+    try {
+      const txHash = await anchorHash(evidence._id.toString(), hash);
+
+      blockchainTxHash = txHash;
+      blockchainStatus = "anchored";
+
+      await Evidence.findByIdAndUpdate(evidence._id, {
+        blockchainTxHash: txHash,
+        blockchainStatus: "anchored",
+        anchoredAt:       new Date(),
       });
 
-    res.status(201).json({
-      message:          "Evidence uploaded successfully",
+      console.log(`✅ Anchored ${evidence._id}  TX: ${txHash}`);
+    } catch (anchorErr) {
+      // Anchoring failed — mark DB, still return 201 so file is saved.
+      // Flutter can call POST /api/evidence/anchor/:id to retry.
+      blockchainStatus = "failed";
+
+      await Evidence.findByIdAndUpdate(evidence._id, {
+        blockchainStatus: "failed",
+      });
+
+      console.error(`❌ Anchor failed for ${evidence._id}:`, anchorErr.message);
+    }
+
+    // ── 6. Respond ────────────────────────────────────────────
+    return res.status(201).json({
+      message:
+        blockchainStatus === "anchored"
+          ? "Evidence uploaded and anchored on blockchain"
+          : "Evidence uploaded — blockchain anchor failed (use retry endpoint)",
       evidenceId:       evidence._id,
       fileName:         evidence.fileName,
       fileHash:         hash,
       downloadURL,
-      blockchainStatus: "pending",
+      blockchainStatus,
+      blockchainTxHash,
     });
   } catch (err) {
     console.error("uploadEvidence error:", err);
@@ -1749,9 +1782,52 @@ exports.uploadEvidence = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
+// POST /api/evidence/anchor/:id          ← NEW ENDPOINT
+// Retry blockchain anchoring for a pending/failed evidence record.
+// Flutter calls this when blockchainStatus is "pending" or "failed".
+// ─────────────────────────────────────────────────────────────
+exports.retryAnchor = async (req, res) => {
+  try {
+    const ev = await Evidence.findById(req.params.id);
+    if (!ev) return res.status(404).json({ message: "Evidence not found" });
+
+    // Already done — just return the existing tx
+    if (ev.blockchainStatus === "anchored") {
+      return res.json({
+        message:          "Already anchored",
+        evidenceId:       ev._id,
+        blockchainStatus: "anchored",
+        blockchainTxHash: ev.blockchainTxHash,
+        anchoredAt:       ev.anchoredAt,
+      });
+    }
+
+    console.log(`🔄 Retrying anchor for evidence ${ev._id} …`);
+
+    const txHash = await anchorHash(ev._id.toString(), ev.fileHash);
+
+    await Evidence.findByIdAndUpdate(ev._id, {
+      blockchainTxHash: txHash,
+      blockchainStatus: "anchored",
+      anchoredAt:       new Date(),
+    });
+
+    console.log(`✅ Retry anchored ${ev._id}  TX: ${txHash}`);
+
+    return res.json({
+      message:          "Anchored successfully",
+      evidenceId:       ev._id,
+      blockchainStatus: "anchored",
+      blockchainTxHash: txHash,
+    });
+  } catch (err) {
+    console.error("retryAnchor error:", err);
+    res.status(500).json({ message: "Anchor failed", error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
 // POST /api/evidence/verify
-// Re-upload a file to check if it matches the stored hash.
-// If tampered → update DB isTampered=true, send alert.
 // ─────────────────────────────────────────────────────────────
 exports.verifyEvidence = async (req, res) => {
   try {
@@ -1768,11 +1844,9 @@ exports.verifyEvidence = async (req, res) => {
       return res.status(404).json({ message: "Evidence record not found" });
     }
 
-    // Compute hash of uploaded file
     const newHash  = generateHash(file.buffer);
     const dbMatch  = newHash === stored.fileHash;
 
-    // Verify on blockchain if anchored
     let chainResult = { valid: null };
     if (stored.blockchainStatus === "anchored") {
       try {
@@ -1785,16 +1859,13 @@ exports.verifyEvidence = async (req, res) => {
     const isTampered = !dbMatch || chainResult.valid === false;
 
     if (isTampered) {
-      // ── REFLECT TAMPER IN DATABASE ────────────────────────
       await Evidence.findByIdAndUpdate(evidenceId, {
         isTampered:   true,
         tamperedAt:   new Date(),
         tamperSource: "manual_verify",
-        // Store the hash that was submitted (the modified one)
         tamperedHash: newHash,
       });
 
-      // Send alert
       await sendTamperAlert({
         evidenceId,
         fileName:     stored.fileName,
@@ -1820,13 +1891,10 @@ exports.verifyEvidence = async (req, res) => {
         hashMatch:       false,
         blockchainValid: chainResult.valid,
         detectedAt:      new Date().toISOString(),
-        // Tell frontend to update the UI
         dbUpdated:       true,
       });
     }
 
-    // ── FILE IS CLEAN ─────────────────────────────────────────
-    // If previously tampered but now OK — clear the flag
     if (stored.isTampered) {
       await Evidence.findByIdAndUpdate(evidenceId, {
         isTampered:   false,
@@ -1836,7 +1904,7 @@ exports.verifyEvidence = async (req, res) => {
       });
     }
 
-    res.json({
+    return res.json({
       status:           "VERIFIED",
       message:          "Evidence integrity CONFIRMED",
       evidenceId,
@@ -1847,7 +1915,7 @@ exports.verifyEvidence = async (req, res) => {
       blockchainValid:  chainResult.valid,
       anchoredAt:       stored.anchoredAt,
       blockchainTxHash: stored.blockchainTxHash,
-      dbUpdated:        stored.isTampered, // true if we cleared a previous tamper
+      dbUpdated:        stored.isTampered,
     });
   } catch (err) {
     console.error("verifyEvidence error:", err);
@@ -1880,14 +1948,11 @@ exports.getStats = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // GET /api/evidence/cases-with-evidence
-// Returns all cases with their evidence grouped — for Evidence List screen
 // ─────────────────────────────────────────────────────────────
 exports.getCasesWithEvidence = async (req, res) => {
   try {
-    // Get all cases
     const cases = await Case.find().sort({ createdAt: -1 }).lean();
 
-    // Get evidence counts and tamper info per case
     const evidenceGroups = await Evidence.aggregate([
       {
         $group: {
@@ -1901,13 +1966,11 @@ exports.getCasesWithEvidence = async (req, res) => {
       },
     ]);
 
-    // Map for quick lookup
     const groupMap = {};
     for (const g of evidenceGroups) {
       groupMap[g._id] = g;
     }
 
-    // Merge
     const result = cases.map((c) => ({
       ...c,
       evidenceStats: groupMap[c._id.toString()] || {
@@ -1925,7 +1988,6 @@ exports.getCasesWithEvidence = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // GET /api/evidence/case/:caseId
-// Get all evidence for a specific case — FULL data including downloadURL
 // ─────────────────────────────────────────────────────────────
 exports.getEvidenceByCase = async (req, res) => {
   try {
@@ -1965,7 +2027,7 @@ exports.getRecentActivity = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/evidence/stats-summary
+// GET /api/evidence/summary
 // ─────────────────────────────────────────────────────────────
 exports.getSummary = async (req, res) => {
   try {
@@ -2006,7 +2068,7 @@ exports.getRecentEvidence = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/evidence/:id
+// GET /api/evidence/:id   (also used for public QR)
 // ─────────────────────────────────────────────────────────────
 exports.getEvidenceById = async (req, res) => {
   try {
@@ -2018,6 +2080,9 @@ exports.getEvidenceById = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────
+// HELPER
+// ─────────────────────────────────────────────────────────────
 function _detectType(mime) {
   if (!mime) return "document";
   if (mime.startsWith("image/")) return "image";
@@ -2026,125 +2091,6 @@ function _detectType(mime) {
   if (mime === "application/pdf") return "document";
   return "document";
 }
-```
-
----
-
-=== src/controllers/custodyController.js ===
-```javascript
-// src/controllers/custodyController.js
-const Custody  = require("../models/Custody");
-const Evidence = require("../models/Evidence");
-const Case     = require("../models/Case");
-const { admin } = require("../config/firebase");
-
-// ── Role display labels ───────────────────────────────────────────────
-const ROLE_LABELS = {
-  police:     "Police Officer",
-  forensic:   "Forensic Expert",
-  prosecutor: "Prosecutor",
-  defense:    "Defense Attorney",
-  court:      "Court Official",
-};
-
-// ── Which roles can transfer to which roles ───────────────────────────
-const ALLOWED_TRANSFERS = {
-  police:     ["forensic", "prosecutor"],
-  forensic:   ["prosecutor", "police"],
-  prosecutor: ["defense", "court"],
-  defense:    ["court"],
-  court:      [],
-};
-
-// ─────────────────────────────────────────────────────────────────────
-// POST /api/custody/transfer
-// ─────────────────────────────────────────────────────────────────────
-exports.transferCustody = async (req, res) => {
-  try {
-    const {
-      evidenceId,
-      toUser,    // target user UID or email
-      toRole,    // target role
-      reason,
-      notes,
-    } = req.body;
-
-    if (!evidenceId || !toUser || !toRole || !reason) {
-      return res.status(400).json({
-        message: "evidenceId, toUser, toRole, and reason are required",
-      });
-    }
-
-    // Check evidence exists
-    const evidence = await Evidence.findById(evidenceId);
-    if (!evidence) {
-      return res.status(404).json({ message: "Evidence not found" });
-    }
-
-    const fromRole = req.user.role || "police";
-
-    // Validate toRole is a known role
-    if (!ROLE_LABELS[toRole]) {
-      return res.status(400).json({
-        message: `Invalid toRole: ${toRole}. Must be one of: ${Object.keys(ROLE_LABELS).join(", ")}`,
-      });
-    }
-
-    // Check transfer is allowed for this role
-    const allowed = ALLOWED_TRANSFERS[fromRole] || [];
-    if (!allowed.includes(toRole)) {
-      return res.status(403).json({
-        message: `${ROLE_LABELS[fromRole] || fromRole} cannot transfer to ${ROLE_LABELS[toRole]}. Allowed: ${allowed.map(r => ROLE_LABELS[r]).join(", ") || "none"}`,
-        allowedRoles: allowed,
-      });
-    }
-
-    // Get chain position (count existing transfers + 1)
-    const existingCount = await Custody.countDocuments({ evidenceId });
-
-    // Get sender info
-    const fromName = req.user.email || req.user.uid;
-
-    // Get receiver display name
-    let toName = toUser;
-    try {
-      // Try to look up by UID first
-      const userRecord = await admin.auth().getUser(toUser).catch(() => null);
-      if (userRecord) {
-        toName = userRecord.email || userRecord.displayName || toUser;
-      }
-    } catch (_) {}
-
-    // Create custody record
-    const custody = await Custody.create({
-      evidenceId,
-      caseId:         evidence.caseId,
-      evidenceName:   evidence.fileName,
-      fromUser:       req.user.uid,
-      fromRole,
-      fromName,
-      toUser,
-      toRole,
-      toName,
-      reason,
-      notes:          notes || "",
-      chainPosition:  existingCount + 1,
-      hashAtTransfer: evidence.fileHash,
-    });
-
-    res.status(201).json({
-      message:   "Custody transferred successfully",
-      custodyId: custody._id,
-      from:      { uid: req.user.uid, role: fromRole, name: fromName },
-      to:        { uid: toUser, role: toRole, name: toName },
-      timestamp: custody.timestamp,
-      chainPosition: custody.chainPosition,
-    });
-  } catch (err) {
-    console.error("transferCustody error:", err);
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-};
 
 // ─────────────────────────────────────────────────────────────────────
 // GET /api/custody/history/:evidenceId
