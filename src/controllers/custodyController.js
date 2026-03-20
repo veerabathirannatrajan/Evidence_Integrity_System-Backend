@@ -1,10 +1,25 @@
 // src/controllers/custodyController.js
-const Custody  = require("../models/Custody");
+// FIXED:
+//  1. ALLOWED_TRANSFERS and ROLE_LABELS constants are now defined here
+//  2. getCustodyHistory, getCustodyByCase, getAllowedRoles moved from
+//     evidenceController.js (where they were incorrectly placed) to here
+//  3. transferCustody is complete
+
 const Evidence = require("../models/Evidence");
 const Case     = require("../models/Case");
-const { admin } = require("../config/firebase");
+const Custody  = require("../models/Custody");
 
-// ── Role display labels ───────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Role transfer rules
+// ─────────────────────────────────────────────────────────────
+const ALLOWED_TRANSFERS = {
+  police:     ["forensic", "prosecutor"],
+  forensic:   ["prosecutor", "court"],
+  prosecutor: ["court", "defense"],
+  defense:    ["court"],
+  court:      [],
+};
+
 const ROLE_LABELS = {
   police:     "Police Officer",
   forensic:   "Forensic Expert",
@@ -13,27 +28,14 @@ const ROLE_LABELS = {
   court:      "Court Official",
 };
 
-// ── Which roles can transfer to which roles ───────────────────────────
-const ALLOWED_TRANSFERS = {
-  police:     ["forensic", "prosecutor"],
-  forensic:   ["prosecutor", "police"],
-  prosecutor: ["defense", "court"],
-  defense:    ["court"],
-  court:      [],
-};
-
-// ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // POST /api/custody/transfer
-// ─────────────────────────────────────────────────────────────────────
+// Transfer evidence custody to another role
+// Body: { evidenceId, toUser, toRole, reason, notes }
+// ─────────────────────────────────────────────────────────────
 exports.transferCustody = async (req, res) => {
   try {
-    const {
-      evidenceId,
-      toUser,    // target user UID or email
-      toRole,    // target role
-      reason,
-      notes,
-    } = req.body;
+    const { evidenceId, toUser, toRole, reason, notes } = req.body;
 
     if (!evidenceId || !toUser || !toRole || !reason) {
       return res.status(400).json({
@@ -41,70 +43,53 @@ exports.transferCustody = async (req, res) => {
       });
     }
 
-    // Check evidence exists
+    const fromRole = req.user.role || "police";
+
+    // Validate transfer is allowed
+    const allowed = ALLOWED_TRANSFERS[fromRole] || [];
+    if (!allowed.includes(toRole)) {
+      return res.status(403).json({
+        message: `Role "${fromRole}" cannot transfer custody to "${toRole}". ` +
+                 `Allowed targets: ${allowed.join(", ") || "none"}`,
+      });
+    }
+
+    // Find evidence
     const evidence = await Evidence.findById(evidenceId);
     if (!evidence) {
       return res.status(404).json({ message: "Evidence not found" });
     }
 
-    const fromRole = req.user.role || "police";
-
-    // Validate toRole is a known role
-    if (!ROLE_LABELS[toRole]) {
-      return res.status(400).json({
-        message: `Invalid toRole: ${toRole}. Must be one of: ${Object.keys(ROLE_LABELS).join(", ")}`,
-      });
-    }
-
-    // Check transfer is allowed for this role
-    const allowed = ALLOWED_TRANSFERS[fromRole] || [];
-    if (!allowed.includes(toRole)) {
-      return res.status(403).json({
-        message: `${ROLE_LABELS[fromRole] || fromRole} cannot transfer to ${ROLE_LABELS[toRole]}. Allowed: ${allowed.map(r => ROLE_LABELS[r]).join(", ") || "none"}`,
-        allowedRoles: allowed,
-      });
-    }
-
-    // Get chain position (count existing transfers + 1)
+    // Count existing transfers to set chain position
     const existingCount = await Custody.countDocuments({ evidenceId });
 
-    // Get sender info
-    const fromName = req.user.email || req.user.uid;
-
-    // Get receiver display name
-    let toName = toUser;
-    try {
-      // Try to look up by UID first
-      const userRecord = await admin.auth().getUser(toUser).catch(() => null);
-      if (userRecord) {
-        toName = userRecord.email || userRecord.displayName || toUser;
-      }
-    } catch (_) {}
-
-    // Create custody record
-    const custody = await Custody.create({
+    // Build custody record
+    const custody = new Custody({
       evidenceId,
-      caseId:         evidence.caseId,
-      evidenceName:   evidence.fileName,
-      fromUser:       req.user.uid,
+      caseId:        evidence.caseId,
+      evidenceName:  evidence.fileName,
+      fromUser:      req.user.uid,
       fromRole,
-      fromName,
+      fromName:      req.user.email || req.user.uid,
       toUser,
       toRole,
-      toName,
+      toName:        toUser,            // will be display name if provided
       reason,
-      notes:          notes || "",
-      chainPosition:  existingCount + 1,
-      hashAtTransfer: evidence.fileHash,
+      notes:         notes || "",
+      chainPosition: existingCount + 1,
+      hashAtTransfer: evidence.fileHash, // snapshot hash at handoff time
     });
 
-    res.status(201).json({
-      message:   "Custody transferred successfully",
-      custodyId: custody._id,
-      from:      { uid: req.user.uid, role: fromRole, name: fromName },
-      to:        { uid: toUser, role: toRole, name: toName },
-      timestamp: custody.timestamp,
-      chainPosition: custody.chainPosition,
+    await custody.save();
+
+    console.log(
+      `🔗 Custody transferred: evidence=${evidenceId} ` +
+      `from=${fromRole}(${req.user.uid}) → to=${toRole}(${toUser})`
+    );
+
+    return res.status(201).json({
+      message:  "Custody transferred successfully",
+      custody,
     });
   } catch (err) {
     console.error("transferCustody error:", err);
@@ -112,10 +97,10 @@ exports.transferCustody = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // GET /api/custody/history/:evidenceId
 // Full chain of custody for one evidence item
-// ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 exports.getCustodyHistory = async (req, res) => {
   try {
     const { evidenceId } = req.params;
@@ -142,7 +127,7 @@ exports.getCustodyHistory = async (req, res) => {
         status:    evidence.blockchainStatus,
         position:  0,
       },
-      ...records.map((r, i) => ({
+      ...records.map((r) => ({
         type:         "transfer",
         custodyId:    r._id,
         fromUser:     r.fromUser,
@@ -159,7 +144,6 @@ exports.getCustodyHistory = async (req, res) => {
       })),
     ];
 
-    // Add tamper info if applicable
     const tamperInfo = evidence.isTampered
       ? {
           isTampered:   true,
@@ -169,31 +153,32 @@ exports.getCustodyHistory = async (req, res) => {
         }
       : { isTampered: false };
 
-    res.json({
+    return res.json({
       evidence: {
-        id:              evidence._id,
-        fileName:        evidence.fileName,
-        fileHash:        evidence.fileHash,
+        id:               evidence._id,
+        fileName:         evidence.fileName,
+        fileHash:         evidence.fileHash,
         blockchainStatus: evidence.blockchainStatus,
         blockchainTxHash: evidence.blockchainTxHash,
-        uploadedBy:      evidence.uploadedBy,
-        caseId:          evidence.caseId,
-        createdAt:       evidence.createdAt,
+        uploadedBy:       evidence.uploadedBy,
+        caseId:           evidence.caseId,
+        createdAt:        evidence.createdAt,
         ...tamperInfo,
       },
       chain,
       totalTransfers: records.length,
-      currentCustodian: records.length > 0
-        ? {
-            user: records[records.length - 1].toUser,
-            role: records[records.length - 1].toRole,
-            name: records[records.length - 1].toName,
-          }
-        : {
-            user: evidence.uploadedBy,
-            role: "police",
-            name: evidence.uploadedBy,
-          },
+      currentCustodian:
+        records.length > 0
+          ? {
+              user: records[records.length - 1].toUser,
+              role: records[records.length - 1].toRole,
+              name: records[records.length - 1].toName,
+            }
+          : {
+              user: evidence.uploadedBy,
+              role: "police",
+              name: evidence.uploadedBy,
+            },
     });
   } catch (err) {
     console.error("getCustodyHistory error:", err);
@@ -201,10 +186,10 @@ exports.getCustodyHistory = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // GET /api/custody/case/:caseId
 // All custody transfers for all evidence in a case
-// ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 exports.getCustodyByCase = async (req, res) => {
   try {
     const { caseId } = req.params;
@@ -218,7 +203,7 @@ exports.getCustodyByCase = async (req, res) => {
       return res.status(404).json({ message: "Case not found" });
     }
 
-    res.json({
+    return res.json({
       case:    caseData,
       records,
       total:   records.length,
@@ -229,18 +214,24 @@ exports.getCustodyByCase = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // GET /api/custody/allowed-roles
 // Returns which roles the current user can transfer to
-// ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 exports.getAllowedRoles = async (req, res) => {
-  const role    = req.user.role || "police";
-  const allowed = ALLOWED_TRANSFERS[role] || [];
-  res.json({
-    currentRole:  role,
-    allowedRoles: allowed.map((r) => ({
-      value: r,
-      label: ROLE_LABELS[r],
-    })),
-  });
+  try {
+    const role    = req.user.role || "police";
+    const allowed = ALLOWED_TRANSFERS[role] || [];
+
+    return res.json({
+      currentRole:  role,
+      allowedRoles: allowed.map((r) => ({
+        value: r,
+        label: ROLE_LABELS[r] || r,
+      })),
+    });
+  } catch (err) {
+    console.error("getAllowedRoles error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
 };

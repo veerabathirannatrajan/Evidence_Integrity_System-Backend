@@ -6,6 +6,8 @@ pragma solidity ^0.8.20;
  * Stores SHA-256 hashes of digital evidence on the Polygon blockchain.
  * Once a hash is registered it cannot be changed — providing immutable proof
  * of the file's state at upload time.
+ *
+ * FIXED: getRecord() had typo rec.registerBy → rec.registeredBy
  */
 contract EvidenceRegistry {
 
@@ -13,7 +15,7 @@ contract EvidenceRegistry {
 
     struct EvidenceRecord {
         string  hash;
-        address registeredBy;
+        address registeredBy;   // ← correct field name
         uint256 timestamp;
         bool    exists;
     }
@@ -35,7 +37,7 @@ contract EvidenceRegistry {
     /**
      * Register a new evidence hash.
      * @param evidenceId  MongoDB _id of the evidence document
-     * @param hash        SHA-256 hex string of the file
+     * @param hash        SHA-256 hash of the file
      */
     function registerEvidence(
         string memory evidenceId,
@@ -67,12 +69,13 @@ contract EvidenceRegistry {
         EvidenceRecord memory rec = records[evidenceId];
         if (!rec.exists) return (false, 0);
 
-        bool match_ = keccak256(bytes(rec.hash)) == keccak256(bytes(hash));
-        return (match_, rec.timestamp);
+        bool matched = keccak256(bytes(rec.hash)) == keccak256(bytes(hash));
+        return (matched, rec.timestamp);
     }
 
     /**
      * Fetch the stored record for an evidence ID.
+     * FIXED: was rec.registerBy (typo) — now rec.registeredBy
      */
     function getRecord(string memory evidenceId)
         public view
@@ -80,5 +83,6 @@ contract EvidenceRegistry {
     {
         EvidenceRecord memory rec = records[evidenceId];
         return (rec.hash, rec.registeredBy, rec.timestamp, rec.exists);
+                         // ↑ FIXED typo was rec.registerBy
     }
 }

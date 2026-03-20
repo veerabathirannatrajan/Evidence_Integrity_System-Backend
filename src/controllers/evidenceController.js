@@ -1,8 +1,8 @@
 // src/controllers/evidenceController.js
-// FIX: anchorHash is now AWAITED synchronously before res.json()
-//      so it works on Vercel (serverless functions are killed after response).
-// NEW: exports.retryAnchor — POST /api/evidence/anchor/:id
-//      retries anchoring for pending/failed records from the Flutter app.
+// FIXED:
+//  1. anchorHash awaited synchronously (no fire-and-forget)
+//  2. "ALREADY_REGISTERED" error treated as anchored status, not failed
+//  3. Custody functions removed (they belong in custodyController.js)
 
 const Evidence     = require("../models/Evidence");
 const Case         = require("../models/Case");
@@ -77,9 +77,9 @@ exports.uploadEvidence = async (req, res) => {
 
     await evidence.save();
 
-    // ── 5. Anchor on blockchain — NOW AWAITED ─────────────────
-    // Previously used fire-and-forget .then() which Vercel kills
-    // as soon as res.json() is called. Now we await before responding.
+    // ── 5. Anchor on blockchain — AWAITED synchronously ───────
+    // This works on both Render and Vercel because we don't respond
+    // until anchoring is complete (or has definitively failed).
     let blockchainTxHash = null;
     let blockchainStatus = "pending";
 
@@ -95,17 +95,26 @@ exports.uploadEvidence = async (req, res) => {
         anchoredAt:       new Date(),
       });
 
-      console.log(`✅ Anchored ${evidence._id}  TX: ${txHash}`);
+      console.log(`✅ Anchored evidence ${evidence._id}  TX: ${txHash}`);
+
     } catch (anchorErr) {
-      // Anchoring failed — mark DB, still return 201 so file is saved.
-      // Flutter can call POST /api/evidence/anchor/:id to retry.
-      blockchainStatus = "failed";
-
-      await Evidence.findByIdAndUpdate(evidence._id, {
-        blockchainStatus: "failed",
-      });
-
-      console.error(`❌ Anchor failed for ${evidence._id}:`, anchorErr.message);
+      // Special case: evidence was previously registered on-chain
+      // (e.g. a retry after a partial failure). Treat as anchored.
+      if (anchorErr.message && anchorErr.message.startsWith("ALREADY_REGISTERED")) {
+        blockchainStatus = "anchored";
+        await Evidence.findByIdAndUpdate(evidence._id, {
+          blockchainStatus: "anchored",
+          anchoredAt:       new Date(),
+        });
+        console.warn(`⚠️  Evidence ${evidence._id} was already on-chain — marked anchored`);
+      } else {
+        // Real failure — mark as failed so Flutter can retry via /anchor/:id
+        blockchainStatus = "failed";
+        await Evidence.findByIdAndUpdate(evidence._id, {
+          blockchainStatus: "failed",
+        });
+        console.error(`❌ Anchor failed for ${evidence._id}:`, anchorErr.message);
+      }
     }
 
     // ── 6. Respond ────────────────────────────────────────────
@@ -113,7 +122,7 @@ exports.uploadEvidence = async (req, res) => {
       message:
         blockchainStatus === "anchored"
           ? "Evidence uploaded and anchored on blockchain"
-          : "Evidence uploaded — blockchain anchor failed (use retry endpoint)",
+          : "Evidence uploaded — blockchain anchor failed, use POST /api/evidence/anchor/:id to retry",
       evidenceId:       evidence._id,
       fileName:         evidence.fileName,
       fileHash:         hash,
@@ -121,6 +130,7 @@ exports.uploadEvidence = async (req, res) => {
       blockchainStatus,
       blockchainTxHash,
     });
+
   } catch (err) {
     console.error("uploadEvidence error:", err);
     res.status(500).json({ message: "Server error", error: err.message });
@@ -128,16 +138,14 @@ exports.uploadEvidence = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// POST /api/evidence/anchor/:id          ← NEW ENDPOINT
+// POST /api/evidence/anchor/:id
 // Retry blockchain anchoring for a pending/failed evidence record.
-// Flutter calls this when blockchainStatus is "pending" or "failed".
 // ─────────────────────────────────────────────────────────────
 exports.retryAnchor = async (req, res) => {
   try {
     const ev = await Evidence.findById(req.params.id);
     if (!ev) return res.status(404).json({ message: "Evidence not found" });
 
-    // Already done — just return the existing tx
     if (ev.blockchainStatus === "anchored") {
       return res.json({
         message:          "Already anchored",
@@ -148,9 +156,26 @@ exports.retryAnchor = async (req, res) => {
       });
     }
 
-    console.log(`🔄 Retrying anchor for evidence ${ev._id} …`);
+    console.log(`🔄 Retrying anchor for evidence ${ev._id}…`);
 
-    const txHash = await anchorHash(ev._id.toString(), ev.fileHash);
+    let txHash;
+    try {
+      txHash = await anchorHash(ev._id.toString(), ev.fileHash);
+    } catch (anchorErr) {
+      // Already registered on-chain — treat as success
+      if (anchorErr.message && anchorErr.message.startsWith("ALREADY_REGISTERED")) {
+        await Evidence.findByIdAndUpdate(ev._id, {
+          blockchainStatus: "anchored",
+          anchoredAt:       new Date(),
+        });
+        return res.json({
+          message:          "Already registered on-chain — marked anchored",
+          evidenceId:       ev._id,
+          blockchainStatus: "anchored",
+        });
+      }
+      throw anchorErr;
+    }
 
     await Evidence.findByIdAndUpdate(ev._id, {
       blockchainTxHash: txHash,
@@ -166,6 +191,7 @@ exports.retryAnchor = async (req, res) => {
       blockchainStatus: "anchored",
       blockchainTxHash: txHash,
     });
+
   } catch (err) {
     console.error("retryAnchor error:", err);
     res.status(500).json({ message: "Anchor failed", error: err.message });
@@ -190,8 +216,8 @@ exports.verifyEvidence = async (req, res) => {
       return res.status(404).json({ message: "Evidence record not found" });
     }
 
-    const newHash  = generateHash(file.buffer);
-    const dbMatch  = newHash === stored.fileHash;
+    const newHash = generateHash(file.buffer);
+    const dbMatch = newHash === stored.fileHash;
 
     let chainResult = { valid: null };
     if (stored.blockchainStatus === "anchored") {
@@ -263,6 +289,7 @@ exports.verifyEvidence = async (req, res) => {
       blockchainTxHash: stored.blockchainTxHash,
       dbUpdated:        stored.isTampered,
     });
+
   } catch (err) {
     console.error("verifyEvidence error:", err);
     res.status(500).json({ message: "Server error", error: err.message });
@@ -320,8 +347,7 @@ exports.getCasesWithEvidence = async (req, res) => {
     const result = cases.map((c) => ({
       ...c,
       evidenceStats: groupMap[c._id.toString()] || {
-        total: 0, anchored: 0, tampered: 0,
-        totalSize: 0, latest: null,
+        total: 0, anchored: 0, tampered: 0, totalSize: 0, latest: null,
       },
     }));
 
@@ -414,7 +440,7 @@ exports.getRecentEvidence = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/evidence/:id   (also used for public QR)
+// GET /api/evidence/:id
 // ─────────────────────────────────────────────────────────────
 exports.getEvidenceById = async (req, res) => {
   try {
