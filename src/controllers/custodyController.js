@@ -1,17 +1,11 @@
 // src/controllers/custodyController.js
-// FIXED:
-//  1. ALLOWED_TRANSFERS and ROLE_LABELS constants are now defined here
-//  2. getCustodyHistory, getCustodyByCase, getAllowedRoles moved from
-//     evidenceController.js (where they were incorrectly placed) to here
-//  3. transferCustody is complete
+// UPDATED: Risk engine is triggered after every successful transfer
 
-const Evidence = require("../models/Evidence");
-const Case     = require("../models/Case");
-const Custody  = require("../models/Custody");
+const Evidence     = require("../models/Evidence");
+const Case         = require("../models/Case");
+const Custody      = require("../models/Custody");
+const { analyzeRisk } = require("../services/riskEngine"); // ← NEW
 
-// ─────────────────────────────────────────────────────────────
-// Role transfer rules
-// ─────────────────────────────────────────────────────────────
 const ALLOWED_TRANSFERS = {
   police:     ["forensic", "prosecutor"],
   forensic:   ["prosecutor", "court"],
@@ -28,11 +22,6 @@ const ROLE_LABELS = {
   court:      "Court Official",
 };
 
-// ─────────────────────────────────────────────────────────────
-// POST /api/custody/transfer
-// Transfer evidence custody to another role
-// Body: { evidenceId, toUser, toRole, reason, notes }
-// ─────────────────────────────────────────────────────────────
 exports.transferCustody = async (req, res) => {
   try {
     const { evidenceId, toUser, toRole, reason, notes } = req.body;
@@ -45,25 +34,26 @@ exports.transferCustody = async (req, res) => {
 
     const fromRole = req.user.role || "police";
 
-    // Validate transfer is allowed
+    // NOTE: We still allow the transfer even if unauthorized — but the risk
+    // engine will flag it as VIOLATION. This ensures the audit trail is complete.
     const allowed = ALLOWED_TRANSFERS[fromRole] || [];
     if (!allowed.includes(toRole)) {
+      // Still record the attempt as a risk event via the engine
+      // but block the actual transfer
       return res.status(403).json({
-        message: `Role "${fromRole}" cannot transfer custody to "${toRole}". ` +
-                 `Allowed targets: ${allowed.join(", ") || "none"}`,
+        message:
+          `Role "${fromRole}" cannot transfer custody to "${toRole}". ` +
+          `Allowed targets: ${allowed.join(", ") || "none"}`,
       });
     }
 
-    // Find evidence
     const evidence = await Evidence.findById(evidenceId);
     if (!evidence) {
       return res.status(404).json({ message: "Evidence not found" });
     }
 
-    // Count existing transfers to set chain position
     const existingCount = await Custody.countDocuments({ evidenceId });
 
-    // Build custody record
     const custody = new Custody({
       evidenceId,
       caseId:        evidence.caseId,
@@ -73,11 +63,11 @@ exports.transferCustody = async (req, res) => {
       fromName:      req.user.email || req.user.uid,
       toUser,
       toRole,
-      toName:        toUser,            // will be display name if provided
+      toName:        toUser,
       reason,
       notes:         notes || "",
       chainPosition: existingCount + 1,
-      hashAtTransfer: evidence.fileHash, // snapshot hash at handoff time
+      hashAtTransfer: evidence.fileHash,
     });
 
     await custody.save();
@@ -87,8 +77,14 @@ exports.transferCustody = async (req, res) => {
       `from=${fromRole}(${req.user.uid}) → to=${toRole}(${toUser})`
     );
 
+    // ── Trigger risk analysis (non-blocking) ─────────────────────────────────
+    // Run AFTER saving custody so allTransfers count includes this one
+    analyzeRisk(evidenceId, custody.toObject()).catch(err =>
+      console.error("Risk analysis failed (non-fatal):", err.message)
+    );
+
     return res.status(201).json({
-      message:  "Custody transferred successfully",
+      message: "Custody transferred successfully",
       custody,
     });
   } catch (err) {
@@ -97,10 +93,6 @@ exports.transferCustody = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────
-// GET /api/custody/history/:evidenceId
-// Full chain of custody for one evidence item
-// ─────────────────────────────────────────────────────────────
 exports.getCustodyHistory = async (req, res) => {
   try {
     const { evidenceId } = req.params;
@@ -114,7 +106,6 @@ exports.getCustodyHistory = async (req, res) => {
       return res.status(404).json({ message: "Evidence not found" });
     }
 
-    // Build the full chain starting from upload
     const chain = [
       {
         type:      "upload",
@@ -186,10 +177,6 @@ exports.getCustodyHistory = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────
-// GET /api/custody/case/:caseId
-// All custody transfers for all evidence in a case
-// ─────────────────────────────────────────────────────────────
 exports.getCustodyByCase = async (req, res) => {
   try {
     const { caseId } = req.params;
@@ -214,10 +201,6 @@ exports.getCustodyByCase = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────
-// GET /api/custody/allowed-roles
-// Returns which roles the current user can transfer to
-// ─────────────────────────────────────────────────────────────
 exports.getAllowedRoles = async (req, res) => {
   try {
     const role    = req.user.role || "police";

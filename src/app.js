@@ -5,6 +5,7 @@ const userRoutes     = require("./routes/userRoutes");
 const caseRoutes     = require("./routes/caseRoutes");
 const evidenceRoutes = require("./routes/evidenceRoutes");
 const custodyRoutes  = require("./routes/custodyRoutes");
+const riskRoutes     = require("./routes/riskRoutes");
 
 const app = express();
 
@@ -21,6 +22,7 @@ app.use("/api/user",     userRoutes);
 app.use("/api/cases",    caseRoutes);
 app.use("/api/evidence", evidenceRoutes);
 app.use("/api/custody",  custodyRoutes);
+app.use("/api/risk",     riskRoutes);
 
 // ─── Global error handler ──────────────────────────────────────────────────
 app.use((err, req, res, next) => {
