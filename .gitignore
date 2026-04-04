@@ -3,3 +3,4 @@ node_modules/
 serviceAccountKey.json
 artifacts/
 cache/
+all_code.txt
